@@ -114,6 +114,8 @@ client/data/qq-gateway-autostart.log
 /model                        显示当前模型和思考强度
 /model gpt-5.5 high           设置模型和思考强度
 /model gpt-5.4 xhigh          设置模型和思考强度
+/timeout                      显示 Codex 单次调用超时
+/timeout 45                   设置单次调用超时为 45 分钟
 /permission                   显示当前权限
 /permission read only         只读模式
 /permission ask               Ask for approval
@@ -124,6 +126,7 @@ client/data/qq-gateway-autostart.log
 /reject [id]                  拒绝待审批请求
 /revise [id] <instruction>    修改待审批请求
 /cancel                       取消当前 Codex 任务或待审批请求
+/restart                      重启 QQ Gateway 客户端
 /resume                       列出 Codex 原生会话
 /resume page 2                列出第 2 页
 /resume <id>                  切换到指定 Codex 会话
@@ -140,6 +143,20 @@ QQ_ALLOWED_EVENTS=C2C_MESSAGE_CREATE,GROUP_AT_MESSAGE_CREATE,INTERACTION_CREATE
 ```
 
 按钮点击会作为本地指令处理，不会发送给 AI。
+
+### 图片和附件
+
+QQ 消息里带图片或附件时，桥接器会把可下载的 `http/https` 附件保存到 `client/data/attachments/`，再把本地绝对路径交给 Codex。纯图片消息也会进入队列。
+
+相关配置：
+
+```env
+QQ_ATTACHMENT_DOWNLOAD=1
+QQ_ATTACHMENT_MAX_COUNT=4
+QQ_ATTACHMENT_MAX_BYTES=26214400
+```
+
+长任务默认 30 分钟超时，可用 `/timeout 45` 在线调整。
 
 ### 权限映射
 
@@ -266,6 +283,8 @@ Messages starting with `/` are handled locally by the bridge and are not sent to
 /model                        Show current model/reasoning
 /model gpt-5.5 high           Set model and reasoning
 /model gpt-5.4 xhigh          Set model and reasoning
+/timeout                      Show Codex task timeout
+/timeout 45                   Set Codex task timeout to 45 minutes
 /permission                   Show current permission mode
 /permission read only         Read-only mode
 /permission ask               Ask for approval
@@ -276,6 +295,7 @@ Messages starting with `/` are handled locally by the bridge and are not sent to
 /reject [id]                  Reject a pending request
 /revise [id] <instruction>    Revise a pending request
 /cancel                       Cancel current Codex task or pending request
+/restart                      Restart the QQ Gateway client
 /resume                       List native Codex sessions
 /resume page 2                List page 2
 /resume <id>                  Switch to a Codex session
@@ -292,6 +312,20 @@ QQ_ALLOWED_EVENTS=C2C_MESSAGE_CREATE,GROUP_AT_MESSAGE_CREATE,INTERACTION_CREATE
 ```
 
 Button clicks are handled as local commands and are not sent to AI.
+
+### Images and Attachments
+
+When a QQ message contains images or files, the bridge downloads available `http/https` attachments into `client/data/attachments/` and passes the local absolute paths to Codex. Image-only messages are accepted.
+
+Related settings:
+
+```env
+QQ_ATTACHMENT_DOWNLOAD=1
+QQ_ATTACHMENT_MAX_COUNT=4
+QQ_ATTACHMENT_MAX_BYTES=26214400
+```
+
+Long Codex tasks default to a 30-minute timeout. Use `/timeout 45` to adjust it at runtime.
 
 ### Permission Mapping
 

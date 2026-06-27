@@ -78,6 +78,7 @@ CODEX_PERMISSION = os.getenv("CODEX_PERMISSION", "read-only").strip() or "read-o
 CODEX_CONTEXT_MODE = os.getenv("CODEX_CONTEXT_MODE", "native").strip().lower() or "native"
 QQ_OWNER_QQ = os.getenv("QQ_OWNER_QQ", "").strip()
 MAX_HISTORY_CHARS = int(os.getenv("MAX_HISTORY_CHARS", "12000"))
+CODEX_TIMEOUT_SECONDS = max(30, int(os.getenv("CODEX_TIMEOUT_SECONDS", "1800")))
 
 ALLOWED_MODELS = [
     item.strip()
@@ -272,12 +273,16 @@ def load_state() -> Dict[str, Any]:
         "model": CODEX_MODEL,
         "reasoning_effort": normalize_reasoning(CODEX_REASONING_EFFORT),
         "permission": normalize_permission(CODEX_PERMISSION),
+        "timeout_seconds": CODEX_TIMEOUT_SECONDS,
         "contacts": {},
     }
     for key, value in defaults.items():
         if key not in state:
             state[key] = value
             changed = True
+    if int(state.get("timeout_seconds", 0) or 0) == 900 and CODEX_TIMEOUT_SECONDS > 900:
+        state["timeout_seconds"] = CODEX_TIMEOUT_SECONDS
+        changed = True
 
     sessions = state.get("sessions")
     if not isinstance(sessions, dict) or not sessions:
@@ -404,6 +409,7 @@ def is_bridge_command_text(text: str) -> bool:
         "/status",
         "/whoami",
         "/model",
+        "/timeout",
         "/permission",
         "/resume",
         "/recent",
@@ -411,6 +417,7 @@ def is_bridge_command_text(text: str) -> bool:
         "/new",
         "/delete",
         "/cancel",
+        "/restart",
         "/allow",
         "/reject",
         "/revise",
@@ -689,6 +696,7 @@ def current_runtime() -> Dict[str, Any]:
         "permission_profile": PERMISSION_PROFILES[permission],
         "active_session_id": str(state.get("active_session_id", "")),
         "active_native_session_id": str(state.get("active_native_session_id", "")),
+        "timeout_seconds": int(state.get("timeout_seconds", CODEX_TIMEOUT_SECONDS) or CODEX_TIMEOUT_SECONDS),
     }
 
 
@@ -1532,14 +1540,16 @@ def run_codex_process(prompt: str, session_id: str = "", job_id: str = "") -> Di
             current_codex_proc = proc
             current_codex_job = job_id
         try:
-            stdout, _ = proc.communicate(
-                input=prompt,
-                timeout=int(os.getenv("CODEX_TIMEOUT_SECONDS", "900")),
-            )
+            timeout_seconds = int(runtime.get("timeout_seconds") or CODEX_TIMEOUT_SECONDS)
+            stdout, _ = proc.communicate(input=prompt, timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             cancel_current_task()
             stdout = ""
-            raise RuntimeError("Codex task timed out and was cancelled")
+            minutes = int((int(runtime.get("timeout_seconds") or CODEX_TIMEOUT_SECONDS) + 59) / 60)
+            raise RuntimeError(
+                f"Codex task timed out after {minutes} min and was cancelled. "
+                "可发送 /timeout 45 调长，或 /cancel 取消当前任务。"
+            )
         finally:
             with current_codex_lock:
                 if current_codex_proc is proc:
@@ -1682,6 +1692,7 @@ def status_text() -> str:
         f"Native active: {runtime['active_native_session_id'] or '(none)'}",
         f"Model: {runtime['model']}",
         f"Reasoning: {runtime['reasoning_effort']}",
+        f"Timeout: {runtime['timeout_seconds']}s",
         f"Permission: {profile['label']} | sandbox={profile['sandbox']} | approval={profile['approval_policy']}",
         f"Pending approvals: {pending_count}",
     ]
@@ -1711,6 +1722,9 @@ def help_text() -> str:
         "/model gpt-5.5 high - 切换模型和思考强度",
         "/model gpt-5.4 xhigh - 支持 gpt-5.5 / gpt-5.4；思考强度 none/minimal/low/medium/high/xhigh",
         "/cancel - 取消当前正在运行的 Codex 任务",
+        "/timeout - 查看 Codex 单次调用超时",
+        "/timeout 45 - 设置单次调用超时为 45 分钟",
+        "/restart - 重启 QQ Gateway 客户端",
         "/permission - 查看当前权限",
         "/permission read only - 只读",
         "/permission ask - Ask for approval",
@@ -1808,6 +1822,23 @@ def parse_model_command(args: str) -> str:
         state["reasoning_effort"] = reasoning
     save_state(state)
     return f"已更新：model={state['model']}，reasoning={state['reasoning_effort']}"
+
+
+def timeout_command(args: str) -> str:
+    state = load_state()
+    current = int(state.get("timeout_seconds", CODEX_TIMEOUT_SECONDS) or CODEX_TIMEOUT_SECONDS)
+    if not args.strip():
+        return (
+            f"当前 Codex 单次调用超时：{current} 秒（约 {int((current + 59) / 60)} 分钟）\n"
+            "用法：/timeout 45  设置为 45 分钟；范围 1-180 分钟。"
+        )
+    match = re.search(r"\d+", args)
+    if not match:
+        return "无法识别超时时长。示例：/timeout 45"
+    minutes = max(1, min(180, int(match.group(0))))
+    state["timeout_seconds"] = minutes * 60
+    save_state(state)
+    return f"已设置 Codex 单次调用超时：{minutes} 分钟。"
 
 
 def parse_permission_command(args: str) -> str:
@@ -1983,6 +2014,8 @@ def handle_bridge_command(text: str, job: Optional[Dict[str, Any]] = None) -> Op
         return whoami_text(job)
     if command == "/model":
         return parse_model_command(args)
+    if command == "/timeout":
+        return timeout_command(args)
     if command == "/permission":
         return parse_permission_command(args)
     if command == "/pending":
@@ -2014,6 +2047,7 @@ def handle_bridge_command(text: str, job: Optional[Dict[str, Any]] = None) -> Op
 
 def run_codex_prompt_mode(job: Dict[str, Any]) -> str:
     remote_text = job.get("text", "")
+    attachments_text = str(job.get("attachments_text", "")).strip()
     runtime = current_process_runtime()
     history = read_history_tail(runtime["active_session_id"])
     profile = runtime["permission_profile"]
@@ -2032,6 +2066,7 @@ def run_codex_prompt_mode(job: Dict[str, Any]) -> str:
 
 远程用户消息：
 {remote_text}
+{attachments_text}
 """
     return run_codex_process(prompt, "", str(job.get("id", ""))).get("text", "")
 
@@ -2040,6 +2075,7 @@ def run_codex_native_mode(job: Dict[str, Any]) -> str:
     state = load_state()
     session_id = str(state.get("active_native_session_id", ""))
     remote_text = job.get("text", "")
+    attachments_text = str(job.get("attachments_text", "")).strip()
     prompt = f"""你正在通过 QQ 远程消息桥接和用户对话。
 
 要求：
@@ -2049,6 +2085,7 @@ def run_codex_native_mode(job: Dict[str, Any]) -> str:
 
 远程用户消息：
 {remote_text}
+{attachments_text}
 """
     result = run_codex_process(prompt, session_id, str(job.get("id", "")))
     thread_id = result.get("thread_id", "")

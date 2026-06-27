@@ -12,7 +12,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 try:
@@ -40,6 +40,8 @@ from codex_bridge_client import (
 
 
 BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+ATTACHMENTS_DIR = DATA_DIR / "attachments"
 load_dotenv(BASE_DIR / ".env")
 
 DEFAULT_INTENTS = (1 << 25) | (1 << 26)
@@ -112,6 +114,10 @@ QQ_ALLOWED_GROUP_OPENIDS = env_csv("QQ_ALLOWED_GROUP_OPENIDS")
 QQ_BUTTON_ACTION_TYPE = env_int("QQ_BUTTON_ACTION_TYPE", 2)
 QQ_BUTTON_AUTO_ENTER = env_bool("QQ_BUTTON_AUTO_ENTER", True)
 QQ_SEND_STARTUP_TO_ALLOWED_USERS = env_bool("QQ_SEND_STARTUP_TO_ALLOWED_USERS", True)
+QQ_ATTACHMENT_DOWNLOAD = env_bool("QQ_ATTACHMENT_DOWNLOAD", True)
+QQ_ATTACHMENT_MAX_COUNT = max(1, min(10, env_int("QQ_ATTACHMENT_MAX_COUNT", 4)))
+QQ_ATTACHMENT_MAX_BYTES = max(1024 * 1024, env_int("QQ_ATTACHMENT_MAX_BYTES", 25 * 1024 * 1024))
+QQ_RESTART_DELAY_SECONDS = max(1, min(30, env_int("QQ_RESTART_DELAY_SECONDS", 2)))
 auto_start_sent_contacts: Set[str] = set()
 auto_start_lock = threading.Lock()
 
@@ -130,6 +136,20 @@ def mark_auto_start_sent(contact_id: str) -> bool:
 def is_cancel_command(text: str) -> bool:
     command, _ = split_command(text)
     return command == "/cancel"
+
+
+def is_restart_command(text: str) -> bool:
+    command, _ = split_command(text)
+    return command == "/restart"
+
+
+def schedule_restart(reason: str = "remote command") -> None:
+    def restart_later() -> None:
+        print(f"[restart] scheduled reason={reason} delay={QQ_RESTART_DELAY_SECONDS}s", flush=True)
+        time.sleep(QQ_RESTART_DELAY_SECONDS)
+        os._exit(0)
+
+    threading.Thread(target=restart_later, name="qq-remote-restart", daemon=True).start()
 
 
 def split_command(text: str) -> tuple[str, str]:
@@ -178,6 +198,141 @@ def collect_strings(value: Any, keys: Set[str]) -> List[str]:
         for item in value:
             found.extend(collect_strings(item, keys))
     return found
+
+
+def safe_filename(name: str, fallback: str) -> str:
+    name = unquote((name or "").split("?", 1)[0].split("#", 1)[0]).strip()
+    name = Path(name).name
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    if not name:
+        name = fallback
+    return name[:120]
+
+
+def filename_from_url(url: str, index: int, content_type: str = "") -> str:
+    parsed = urlparse(url)
+    name = safe_filename(Path(parsed.path).name, f"attachment-{index}")
+    if "." not in name:
+        ext_map = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+            "image/bmp": ".bmp",
+        }
+        name += ext_map.get(content_type.lower().split(";", 1)[0].strip(), ".bin")
+    return name
+
+
+def collect_attachment_candidates(value: Any) -> List[Dict[str, str]]:
+    candidates: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+    container_keys = {"attachments", "attachment", "images", "image", "files", "file", "media"}
+    url_keys = {"url", "file_url", "download_url", "image_url", "src", "proxy_url"}
+    attachment_markers = {"filename", "file_name", "content_type", "size", "width", "height"}
+
+    def add(url: str, kind: str = "", name: str = "") -> None:
+        url = (url or "").strip()
+        if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+            return
+        if url in seen:
+            return
+        seen.add(url)
+        candidates.append({"url": url, "kind": kind.strip(), "name": name.strip()})
+
+    def walk(item: Any, hint: str = "") -> None:
+        if isinstance(item, dict):
+            local_hint = hint
+            item_type = str(item.get("type") or item.get("content_type") or item.get("file_type") or "").lower()
+            if "image" in item_type:
+                local_hint = "image"
+            if not local_hint and (attachment_markers & set(str(key) for key in item.keys())):
+                local_hint = "file"
+            name = first_string(item, {"filename", "file_name", "name"})
+            for key in url_keys:
+                value = item.get(key)
+                if isinstance(value, str) and (local_hint or key != "url"):
+                    key_hint = "image" if "image" in key.lower() or local_hint == "image" else local_hint
+                    add(value, key_hint, name)
+            for key in container_keys:
+                if key in item:
+                    next_hint = "image" if "image" in key.lower() else local_hint
+                    walk(item.get(key), next_hint)
+        elif isinstance(item, list):
+            for child in item:
+                walk(child, hint)
+        elif isinstance(item, str) and hint:
+            add(item, hint)
+
+    walk(value)
+    return candidates[:QQ_ATTACHMENT_MAX_COUNT]
+
+
+def download_attachments(job_id: str, data: Dict[str, Any]) -> List[Dict[str, str]]:
+    if not QQ_ATTACHMENT_DOWNLOAD:
+        return []
+    attachments: List[Dict[str, str]] = []
+    candidates = collect_attachment_candidates(data)
+    if not candidates:
+        return []
+
+    target_dir = ATTACHMENTS_DIR / safe_filename(job_id, uuid.uuid4().hex)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    headers = {"User-Agent": USER_AGENT}
+    for index, candidate in enumerate(candidates, 1):
+        url = candidate["url"]
+        try:
+            req = Request(url, headers=headers, method="GET")
+            with urlopen(req, timeout=30) as resp:
+                content_type = str(resp.headers.get("Content-Type") or "")
+                content_length = str(resp.headers.get("Content-Length") or "").strip()
+                if content_length and int(content_length) > QQ_ATTACHMENT_MAX_BYTES:
+                    raise RuntimeError(f"file too large: {content_length} bytes")
+                filename = safe_filename(candidate.get("name", ""), "")
+                if not filename:
+                    filename = filename_from_url(url, index, content_type)
+                path = target_dir / filename
+                total = 0
+                with path.open("wb") as f:
+                    while True:
+                        chunk = resp.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > QQ_ATTACHMENT_MAX_BYTES:
+                            raise RuntimeError(f"file too large: >{QQ_ATTACHMENT_MAX_BYTES} bytes")
+                        f.write(chunk)
+            attachments.append({
+                "path": str(path.resolve()),
+                "url": url,
+                "kind": candidate.get("kind", ""),
+                "content_type": content_type,
+                "bytes": str(total),
+            })
+            print(f"[qq-attachment] saved {path} bytes={total}", flush=True)
+        except Exception as exc:
+            print(f"[qq-attachment-error] url={url[:120]} {exc}", flush=True)
+            attachments.append({
+                "path": "",
+                "url": url,
+                "kind": candidate.get("kind", ""),
+                "error": str(exc),
+            })
+    return attachments
+
+
+def format_attachments_for_codex(attachments: List[Dict[str, str]]) -> str:
+    if not attachments:
+        return ""
+    lines = ["", "用户随消息附带了以下本地附件。请在需要时直接读取这些本地路径；图片可以按视觉内容分析："]
+    for index, item in enumerate(attachments, 1):
+        path = item.get("path", "")
+        if path:
+            label = item.get("kind") or item.get("content_type") or "file"
+            lines.append(f"{index}. {label}: {path}")
+        else:
+            lines.append(f"{index}. 附件下载失败：{item.get('error', 'unknown error')} | {item.get('url', '')}")
+    return "\n".join(lines)
 
 
 def extract_button_command(data: Dict[str, Any]) -> str:
@@ -870,8 +1025,21 @@ def extract_job(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     msg_id = str(data.get("id", ""))
     content = clean_content(str(data.get("content", "")))
-    if not msg_id or not content:
+    job_id = uuid.uuid4().hex
+    if not msg_id:
         return None
+
+    def enrich_job(reply_job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        attachments = download_attachments(job_id, data)
+        final_content = content
+        if not final_content and attachments:
+            final_content = "请分析这条消息附带的图片或文件。"
+        if not final_content:
+            return None
+        reply_job["text"] = final_content
+        reply_job["attachments"] = attachments
+        reply_job["attachments_text"] = format_attachments_for_codex(attachments)
+        return reply_job
 
     if event_type == "C2C_MESSAGE_CREATE":
         openid = str((data.get("author") or {}).get("user_openid", ""))
@@ -880,15 +1048,15 @@ def extract_job(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if QQ_ALLOWED_USER_OPENIDS and openid not in QQ_ALLOWED_USER_OPENIDS:
             print(f"[qq] blocked c2c user {openid[:12]}", flush=True)
             return None
-        return {
-            "id": uuid.uuid4().hex,
+        return enrich_job({
+            "id": job_id,
             "source": "qq-gateway",
             "from": "qq:c2c:" + openid[:12],
             "text": content,
             "event_type": event_type,
             "msg_id": msg_id,
             "reply": {"kind": "c2c", "openid": openid, "msg_id": msg_id},
-        }
+        })
 
     if event_type in {"GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"}:
         group_openid = str(data.get("group_openid", ""))
@@ -897,43 +1065,43 @@ def extract_job(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if QQ_ALLOWED_GROUP_OPENIDS and group_openid not in QQ_ALLOWED_GROUP_OPENIDS:
             print(f"[qq] blocked group {group_openid[:12]}", flush=True)
             return None
-        return {
-            "id": uuid.uuid4().hex,
+        return enrich_job({
+            "id": job_id,
             "source": "qq-gateway",
             "from": "qq:group:" + group_openid[:12],
             "text": content,
             "event_type": event_type,
             "msg_id": msg_id,
             "reply": {"kind": "group", "group_openid": group_openid, "msg_id": msg_id},
-        }
+        })
 
     if event_type == "AT_MESSAGE_CREATE":
         channel_id = str(data.get("channel_id", ""))
         if not channel_id:
             return None
-        return {
-            "id": uuid.uuid4().hex,
+        return enrich_job({
+            "id": job_id,
             "source": "qq-gateway",
             "from": "qq:channel:" + channel_id,
             "text": content,
             "event_type": event_type,
             "msg_id": msg_id,
             "reply": {"kind": "channel", "channel_id": channel_id, "msg_id": msg_id},
-        }
+        })
 
     if event_type == "DIRECT_MESSAGE_CREATE":
         guild_id = str(data.get("guild_id", ""))
         if not guild_id:
             return None
-        return {
-            "id": uuid.uuid4().hex,
+        return enrich_job({
+            "id": job_id,
             "source": "qq-gateway",
             "from": "qq:dm:" + guild_id,
             "text": content,
             "event_type": event_type,
             "msg_id": msg_id,
             "reply": {"kind": "dm", "guild_id": guild_id, "msg_id": msg_id},
-        }
+        })
 
     return None
 
@@ -1025,9 +1193,21 @@ def worker_loop(api: QQApi, jobs: "queue.Queue[Dict[str, Any]]", stop_event: thr
         except queue.Empty:
             continue
 
-        print(f"[job] {job['event_type']} from={job['from']} chars={len(job['text'])}", flush=True)
+        print(
+            f"[job] {job['event_type']} from={job['from']} chars={len(job['text'])} "
+            f"attachments={len(job.get('attachments') or [])}",
+            flush=True,
+        )
         seq = 1
         command_name, _ = split_command(job["text"])
+        if command_name == "/restart":
+            try:
+                api.send_message(job["reply"], "收到，正在重启 QQ Gateway 客户端。稍等几秒后再发送 /status 验证。", seq)
+            except Exception as exc:
+                print(f"[qq-send-restart-error] {exc}", flush=True)
+            jobs.task_done()
+            schedule_restart("worker command")
+            continue
         if command_name == "/start":
             mark_auto_start_sent(str(job.get("from", "")))
         if command_name != "/start" and mark_auto_start_sent(str(job.get("from", ""))):
@@ -1099,7 +1279,8 @@ def worker_loop(api: QQApi, jobs: "queue.Queue[Dict[str, Any]]", stop_event: thr
             jobs.task_done()
             continue
 
-        append_history("User", f"[{job['from']}]\n{job['text']}")
+        history_extra = str(job.get("attachments_text", "")).strip()
+        append_history("User", f"[{job['from']}]\n{job['text']}\n{history_extra}".strip())
         try:
             answer = run_codex(job)
             append_history("Codex", answer)
@@ -1280,7 +1461,8 @@ class QQGatewayClient:
                 return
 
             print(
-                f"[gateway] extracted job event={job['event_type']} reply={job['reply']['kind']} id={job['id']}",
+                f"[gateway] extracted job event={job['event_type']} reply={job['reply']['kind']} "
+                f"id={job['id']} attachments={len(job.get('attachments') or [])}",
                 flush=True,
             )
 
@@ -1295,6 +1477,15 @@ class QQGatewayClient:
                     self.api.send_message(job["reply"], cancel_current_task(), 1)
                 except Exception as exc:
                     print(f"[qq-send-cancel-error] {exc}", flush=True)
+                return
+
+            if is_restart_command(job["text"]):
+                print(f"[gateway] immediate restart from={job['from']}", flush=True)
+                try:
+                    self.api.send_message(job["reply"], "收到，正在重启 QQ Gateway 客户端。稍等几秒后再发送 /status 验证。", 1)
+                except Exception as exc:
+                    print(f"[qq-send-restart-error] {exc}", flush=True)
+                schedule_restart("gateway command")
                 return
 
             try:

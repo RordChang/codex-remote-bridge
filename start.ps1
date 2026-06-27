@@ -363,7 +363,7 @@ function Write-EnvFile {
         "CODEX_PERMISSION=$(Get-EnvValue -Map $Existing -Key 'CODEX_PERMISSION' -DefaultValue 'read-only')",
         "CODEX_CONTEXT_MODE=$(Get-EnvValue -Map $Existing -Key 'CODEX_CONTEXT_MODE' -DefaultValue 'native')",
         "CODEX_ALLOWED_MODELS=$(Get-EnvValue -Map $Existing -Key 'CODEX_ALLOWED_MODELS' -DefaultValue 'gpt-5.5,gpt-5.4')",
-        "CODEX_TIMEOUT_SECONDS=$(Get-EnvValue -Map $Existing -Key 'CODEX_TIMEOUT_SECONDS' -DefaultValue '900')",
+        "CODEX_TIMEOUT_SECONDS=$(Get-EnvValue -Map $Existing -Key 'CODEX_TIMEOUT_SECONDS' -DefaultValue '1800')",
         "MAX_HISTORY_CHARS=$(Get-EnvValue -Map $Existing -Key 'MAX_HISTORY_CHARS' -DefaultValue '12000')",
         "",
         "# QQ official Gateway mode.",
@@ -381,6 +381,10 @@ function Write-EnvFile {
         "QQ_SEND_PROCESSING_MESSAGE=$(Get-EnvValue -Map $Existing -Key 'QQ_SEND_PROCESSING_MESSAGE' -DefaultValue '1')",
         "QQ_PROCESSING_TEXT=$(Get-EnvValue -Map $Existing -Key 'QQ_PROCESSING_TEXT' -DefaultValue 'Received, processing.')",
         "QQ_SEND_STARTUP_TO_ALLOWED_USERS=$(Get-EnvValue -Map $Existing -Key 'QQ_SEND_STARTUP_TO_ALLOWED_USERS' -DefaultValue '1')",
+        "QQ_ATTACHMENT_DOWNLOAD=$(Get-EnvValue -Map $Existing -Key 'QQ_ATTACHMENT_DOWNLOAD' -DefaultValue '1')",
+        "QQ_ATTACHMENT_MAX_COUNT=$(Get-EnvValue -Map $Existing -Key 'QQ_ATTACHMENT_MAX_COUNT' -DefaultValue '4')",
+        "QQ_ATTACHMENT_MAX_BYTES=$(Get-EnvValue -Map $Existing -Key 'QQ_ATTACHMENT_MAX_BYTES' -DefaultValue '26214400')",
+        "QQ_RESTART_DELAY_SECONDS=$(Get-EnvValue -Map $Existing -Key 'QQ_RESTART_DELAY_SECONDS' -DefaultValue '2')",
         "",
         "# Optional labels and allowlists.",
         "# Send /whoami to the bot first, then put user_openid into QQ_ALLOWED_USER_OPENIDS.",
@@ -603,11 +607,13 @@ function Show-QuickStartHelp {
     Write-Host "  /model                        显示当前模型和思考强度"
     Write-Host "  /model gpt-5.5 high           设置模型和思考强度"
     Write-Host "  /permission                   显示权限模式"
+    Write-Host "  /timeout 45                   设置单次 Codex 调用超时为 45 分钟"
     Write-Host "  /permission read only         使用只读模式"
     Write-Host "  /permission ask               高风险操作前请求批准"
     Write-Host "  /pending                      显示待批准操作"
     Write-Host "  /allow <id>                   批准待执行操作"
     Write-Host "  /cancel                       取消当前 Codex 任务"
+    Write-Host "  /restart                      重启 QQ Gateway 客户端"
     Write-Host "  /resume                       列出 Codex 原生会话"
     Write-Host "  /new [标题]                   开启新的 Codex 会话"
     if ($IsBackground) {
