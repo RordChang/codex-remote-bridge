@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 import html
 import json
 import os
@@ -117,6 +118,9 @@ QQ_SEND_STARTUP_TO_ALLOWED_USERS = env_bool("QQ_SEND_STARTUP_TO_ALLOWED_USERS", 
 QQ_ATTACHMENT_DOWNLOAD = env_bool("QQ_ATTACHMENT_DOWNLOAD", True)
 QQ_ATTACHMENT_MAX_COUNT = max(1, min(10, env_int("QQ_ATTACHMENT_MAX_COUNT", 4)))
 QQ_ATTACHMENT_MAX_BYTES = max(1024 * 1024, env_int("QQ_ATTACHMENT_MAX_BYTES", 25 * 1024 * 1024))
+QQ_SEND_LOCAL_IMAGES = env_bool("QQ_SEND_LOCAL_IMAGES", True)
+QQ_SEND_IMAGE_MAX_COUNT = max(1, min(10, env_int("QQ_SEND_IMAGE_MAX_COUNT", 4)))
+QQ_SEND_IMAGE_MAX_BYTES = max(1024 * 1024, env_int("QQ_SEND_IMAGE_MAX_BYTES", 10 * 1024 * 1024))
 QQ_RESTART_DELAY_SECONDS = max(1, min(30, env_int("QQ_RESTART_DELAY_SECONDS", 2)))
 auto_start_sent_contacts: Set[str] = set()
 auto_start_lock = threading.Lock()
@@ -333,6 +337,50 @@ def format_attachments_for_codex(attachments: List[Dict[str, str]]) -> str:
         else:
             lines.append(f"{index}. 附件下载失败：{item.get('error', 'unknown error')} | {item.get('url', '')}")
     return "\n".join(lines)
+
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+
+def is_local_image_path(value: str) -> bool:
+    raw = (value or "").strip().strip('"').strip("'")
+    if not raw or re.match(r"^[a-z]+://", raw, flags=re.IGNORECASE):
+        return False
+    path = Path(raw)
+    return path.suffix.lower() in IMAGE_EXTENSIONS and path.exists() and path.is_file()
+
+
+def parse_outbound_images(text: str) -> tuple[str, List[str]]:
+    if not QQ_SEND_LOCAL_IMAGES:
+        return text, []
+    image_paths: List[str] = []
+
+    def add_path(raw: str) -> None:
+        raw = (raw or "").strip().strip("<>").strip()
+        if is_local_image_path(raw):
+            resolved = str(Path(raw).resolve())
+            if resolved not in image_paths:
+                image_paths.append(resolved)
+
+    remaining_lines: List[str] = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        match = re.match(r"^(?:SEND_IMAGE|IMAGE|图片|发图)\s*[:：]\s*(.+)$", stripped, flags=re.IGNORECASE)
+        if match:
+            add_path(match.group(1))
+            continue
+        remaining_lines.append(line)
+
+    remaining = "\n".join(remaining_lines)
+    markdown_pattern = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+
+    def replace_markdown(match: re.Match[str]) -> str:
+        target = match.group(1).strip()
+        add_path(target)
+        return "" if is_local_image_path(target) else match.group(0)
+
+    remaining = markdown_pattern.sub(replace_markdown, remaining).strip()
+    return remaining, image_paths[:QQ_SEND_IMAGE_MAX_COUNT]
 
 
 def extract_button_command(data: Dict[str, Any]) -> str:
@@ -945,19 +993,22 @@ class QQApi:
     def interaction_response(self, interaction_id: str, code: int = 0) -> Dict[str, Any]:
         return self.put(f"/interactions/{quote(interaction_id, safe='')}", {"code": code})
 
-    def send_payload(self, reply: Dict[str, str], payload: Dict[str, Any], msg_seq: int) -> Dict[str, Any]:
+    def target_path(self, reply: Dict[str, str], suffix: str) -> str:
         kind = reply["kind"]
         if kind == "c2c":
-            path = f"/v2/users/{quote(reply['openid'], safe='')}/messages"
+            base = f"/v2/users/{quote(reply['openid'], safe='')}"
         elif kind == "group":
-            path = f"/v2/groups/{quote(reply['group_openid'], safe='')}/messages"
+            base = f"/v2/groups/{quote(reply['group_openid'], safe='')}"
         elif kind == "channel":
-            path = f"/channels/{quote(reply['channel_id'], safe='')}/messages"
+            base = f"/channels/{quote(reply['channel_id'], safe='')}"
         elif kind == "dm":
-            path = f"/dms/{quote(reply['guild_id'], safe='')}/messages"
+            base = f"/dms/{quote(reply['guild_id'], safe='')}"
         else:
             raise RuntimeError(f"unsupported reply kind: {kind}")
+        return base + suffix
 
+    def send_payload(self, reply: Dict[str, str], payload: Dict[str, Any], msg_seq: int) -> Dict[str, Any]:
+        path = self.target_path(reply, "/messages")
         payload = dict(payload)
         if reply.get("event_id"):
             payload["event_id"] = reply["event_id"]
@@ -970,6 +1021,29 @@ class QQApi:
         return self.send_payload(reply, {
             "content": content,
             "msg_type": 0,
+        }, msg_seq)
+
+    def upload_media(self, reply: Dict[str, str], path: str, file_type: int = 1) -> str:
+        image_path = Path(path)
+        size = image_path.stat().st_size
+        if size > QQ_SEND_IMAGE_MAX_BYTES:
+            raise RuntimeError(f"image too large: {size} bytes")
+        file_data = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        data = self.post(self.target_path(reply, "/files"), {
+            "file_type": file_type,
+            "srv_send_msg": False,
+            "file_data": file_data,
+        })
+        file_info = str(data.get("file_info") or "")
+        if not file_info:
+            raise RuntimeError("QQ upload response missing file_info")
+        return file_info
+
+    def send_image(self, reply: Dict[str, str], path: str, msg_seq: int) -> Dict[str, Any]:
+        file_info = self.upload_media(reply, path, file_type=1)
+        return self.send_payload(reply, {
+            "msg_type": 7,
+            "media": {"file_info": file_info},
         }, msg_seq)
 
     def send_markdown_keyboard(
@@ -1116,6 +1190,46 @@ def split_reply(text: str, max_chars: int, max_chunks: int) -> List[str]:
     suffix = "\n\n[内容过长，已截断]"
     parts[-1] = (parts[-1][:max(0, max_chars - len(suffix))] + suffix).strip()
     return parts
+
+
+def send_text_and_images(
+    api: QQApi,
+    reply: Dict[str, str],
+    text: str,
+    msg_seq: int,
+    max_chunks: int,
+    log_label: str,
+) -> int:
+    clean_text, image_paths = parse_outbound_images(text)
+    seq = msg_seq
+    chunks = split_reply(clean_text, QQ_REPLY_MAX_CHARS, max_chunks) if clean_text.strip() else []
+    if not chunks and not image_paths:
+        chunks = ["(Codex returned an empty response.)"]
+
+    for part in chunks:
+        try:
+            api.send_message(reply, part, seq)
+            print(f"[{log_label}] text chars={len(part)}", flush=True)
+            seq += 1
+            time.sleep(0.4)
+        except Exception as exc:
+            print(f"[{log_label}-error] text {exc}", flush=True)
+            return seq
+
+    for image_path in image_paths:
+        try:
+            api.send_image(reply, image_path, seq)
+            print(f"[{log_label}] image path={image_path}", flush=True)
+            seq += 1
+            time.sleep(0.4)
+        except Exception as exc:
+            print(f"[{log_label}-error] image {image_path}: {exc}", flush=True)
+            try:
+                api.send_message(reply, f"图片发送失败：{image_path}\n{exc}", seq)
+                seq += 1
+            except Exception as send_exc:
+                print(f"[{log_label}-error] image fallback {send_exc}", flush=True)
+    return seq
 
 
 def event_debug_summary(event_type: str, data: Any) -> str:
@@ -1289,15 +1403,7 @@ def worker_loop(api: QQApi, jobs: "queue.Queue[Dict[str, Any]]", stop_event: thr
             append_history("BridgeError", str(exc))
 
         remaining_chunks = max(1, QQ_MAX_REPLY_CHUNKS - (seq - 1))
-        for part in split_reply(answer, QQ_REPLY_MAX_CHARS, remaining_chunks):
-            try:
-                api.send_message(job["reply"], part, seq)
-                print(f"[qq-send-answer] event={job['event_type']} chars={len(part)}", flush=True)
-                seq += 1
-                time.sleep(0.4)
-            except Exception as exc:
-                print(f"[qq-send-error] {exc}", flush=True)
-                break
+        seq = send_text_and_images(api, job["reply"], answer, seq, remaining_chunks, "qq-send-answer")
 
         jobs.task_done()
 

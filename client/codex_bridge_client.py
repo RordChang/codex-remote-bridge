@@ -2058,6 +2058,7 @@ def run_codex_prompt_mode(job: Dict[str, Any]) -> str:
 - 直接回答用户问题，不要提到桥接内部实现。
 - 当前权限模式：{profile['label']}；sandbox={profile['sandbox']}；approval={profile['approval_policy']}。
 - 不要读取或泄露本机敏感信息，除非用户明确要求且当前权限模式允许。
+- 如果需要把本地图片发回 QQ，请单独输出一行：SEND_IMAGE: <本地图片绝对路径>。
 - 必要上下文在下面的当前会话历史片段里。
 
 当前会话：{runtime['active_session_id']}
@@ -2082,6 +2083,7 @@ def run_codex_native_mode(job: Dict[str, Any]) -> str:
 - 用中文回答。
 - 直接回答用户问题。
 - 不要提到桥接内部实现。
+- 如果需要把本地图片发回 QQ，请单独输出一行：SEND_IMAGE: <本地图片绝对路径>。
 
 远程用户消息：
 {remote_text}

@@ -148,12 +148,17 @@ QQ_ALLOWED_EVENTS=C2C_MESSAGE_CREATE,GROUP_AT_MESSAGE_CREATE,INTERACTION_CREATE
 
 QQ 消息里带图片或附件时，桥接器会把可下载的 `http/https` 附件保存到 `client/data/attachments/`，再把本地绝对路径交给 Codex。纯图片消息也会进入队列。
 
+Codex 回复中如果包含单独一行 `SEND_IMAGE: C:\path\to\image.png`，桥接器会把这张本地图片上传并发送回 QQ。Markdown 图片路径 `![alt](C:\path\to\image.png)` 也会被识别。
+
 相关配置：
 
 ```env
 QQ_ATTACHMENT_DOWNLOAD=1
 QQ_ATTACHMENT_MAX_COUNT=4
 QQ_ATTACHMENT_MAX_BYTES=26214400
+QQ_SEND_LOCAL_IMAGES=1
+QQ_SEND_IMAGE_MAX_COUNT=4
+QQ_SEND_IMAGE_MAX_BYTES=10485760
 ```
 
 长任务默认 30 分钟超时，可用 `/timeout 45` 在线调整。
@@ -317,12 +322,17 @@ Button clicks are handled as local commands and are not sent to AI.
 
 When a QQ message contains images or files, the bridge downloads available `http/https` attachments into `client/data/attachments/` and passes the local absolute paths to Codex. Image-only messages are accepted.
 
+If a Codex reply contains a standalone `SEND_IMAGE: C:\path\to\image.png` line, the bridge uploads that local image and sends it back to QQ. Markdown image paths such as `![alt](C:\path\to\image.png)` are recognized too.
+
 Related settings:
 
 ```env
 QQ_ATTACHMENT_DOWNLOAD=1
 QQ_ATTACHMENT_MAX_COUNT=4
 QQ_ATTACHMENT_MAX_BYTES=26214400
+QQ_SEND_LOCAL_IMAGES=1
+QQ_SEND_IMAGE_MAX_COUNT=4
+QQ_SEND_IMAGE_MAX_BYTES=10485760
 ```
 
 Long Codex tasks default to a 30-minute timeout. Use `/timeout 45` to adjust it at runtime.
