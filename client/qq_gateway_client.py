@@ -26,6 +26,7 @@ from codex_bridge_client import (
     approval_prompt_text,
     cancel_current_task,
     current_runtime,
+    create_pending_approval,
     handle_bridge_command,
     job_session_key,
     list_native_sessions,
@@ -36,6 +37,7 @@ from codex_bridge_client import (
     parse_resume_args,
     prepare_bridge_approval,
     run_codex,
+    save_state,
     session_title,
     start_text,
 )
@@ -101,12 +103,15 @@ QQ_REPLY_MAX_CHARS = env_int("QQ_REPLY_MAX_CHARS", 1500)
 QQ_MAX_REPLY_CHUNKS = max(1, min(5, env_int("QQ_MAX_REPLY_CHUNKS", 5)))
 QQ_JOB_QUEUE_SIZE = env_int("QQ_JOB_QUEUE_SIZE", 5)
 QQ_CODEX_MAX_PARALLEL = max(1, min(6, env_int("QQ_CODEX_MAX_PARALLEL", 5)))
-QQ_TASK_STATUS_INTERVAL_SECONDS = max(15, env_int("QQ_TASK_STATUS_INTERVAL_SECONDS", 60))
+QQ_TASK_STATUS_INTERVAL_SECONDS = max(15, env_int("QQ_TASK_STATUS_INTERVAL_SECONDS", 300))
 QQ_TASK_PARTIAL_INTERVAL_SECONDS = max(15, env_int("QQ_TASK_PARTIAL_INTERVAL_SECONDS", 60))
 QQ_TASK_PARTIAL_MAX_CHARS = max(200, env_int("QQ_TASK_PARTIAL_MAX_CHARS", 1200))
+QQ_SEND_PARTIAL_OUTPUTS = env_bool("QQ_SEND_PARTIAL_OUTPUTS", False)
+QQ_SHOW_TASK_CONTEXT_ON_FINAL = env_bool("QQ_SHOW_TASK_CONTEXT_ON_FINAL", True)
+QQ_TRUNCATE_LONG_REPLIES = env_bool("QQ_TRUNCATE_LONG_REPLIES", True)
 QQ_RECONNECT_SECONDS = env_int("QQ_RECONNECT_SECONDS", 5)
 QQ_DEDUP_SECONDS = env_int("QQ_DEDUP_SECONDS", 600)
-QQ_SEND_PROCESSING_MESSAGE = env_bool("QQ_SEND_PROCESSING_MESSAGE", True)
+QQ_SEND_PROCESSING_MESSAGE = env_bool("QQ_SEND_PROCESSING_MESSAGE", False)
 QQ_PROCESSING_TEXT = os.getenv("QQ_PROCESSING_TEXT", "收到，正在处理。").strip()
 QQ_USE_RESUME = env_bool("QQ_USE_RESUME", True)
 QQ_SEND_UNION_APPID_HEADER = env_bool("QQ_SEND_UNION_APPID_HEADER", True)
@@ -129,6 +134,39 @@ QQ_SEND_IMAGE_MAX_BYTES = max(1024 * 1024, env_int("QQ_SEND_IMAGE_MAX_BYTES", 10
 QQ_RESTART_DELAY_SECONDS = max(1, min(30, env_int("QQ_RESTART_DELAY_SECONDS", 2)))
 auto_start_sent_contacts: Set[str] = set()
 auto_start_lock = threading.Lock()
+send_partial_outputs = QQ_SEND_PARTIAL_OUTPUTS
+show_task_context_on_final = QQ_SHOW_TASK_CONTEXT_ON_FINAL
+truncate_long_replies = QQ_TRUNCATE_LONG_REPLIES
+task_status_interval_seconds = QQ_TASK_STATUS_INTERVAL_SECONDS
+task_output_settings_lock = threading.Lock()
+
+
+def save_runtime_setting(name: str, value: Any) -> None:
+    state = load_state()
+    state[name] = value
+    save_state(state)
+
+
+def initialize_runtime_settings() -> None:
+    global truncate_long_replies, task_status_interval_seconds
+    state = load_state()
+    changed = False
+    with task_output_settings_lock:
+        if "truncate_long_replies" in state:
+            truncate_long_replies = bool(state.get("truncate_long_replies"))
+        else:
+            state["truncate_long_replies"] = truncate_long_replies
+            changed = True
+        if "task_status_interval_seconds" in state:
+            task_status_interval_seconds = max(0, int(state.get("task_status_interval_seconds") or 0))
+        else:
+            state["task_status_interval_seconds"] = task_status_interval_seconds
+            changed = True
+    if changed:
+        save_state(state)
+
+
+initialize_runtime_settings()
 
 
 def mark_auto_start_sent(contact_id: str) -> bool:
@@ -763,6 +801,7 @@ def build_start_card() -> Dict[str, Any]:
             "buttons": [
                 keyboard_button("Codex会话列表", "/resume", button_id="start-resume", style=1),
                 keyboard_button("模型设置", "/model", button_id="start-model", style=1),
+                keyboard_button("设置", "/setup", button_id="start-setup", style=0),
             ]
         },
         {
@@ -782,6 +821,184 @@ def build_start_card() -> Dict[str, Any]:
             "点击按钮开始使用。",
         ]),
         "keyboard": {"rows": rows},
+    }
+
+
+def build_setup_card() -> Dict[str, Any]:
+    runtime = current_runtime()
+    with task_output_settings_lock:
+        partial_on = send_partial_outputs
+        context_on = show_task_context_on_final
+        truncate_on = truncate_long_replies
+        heartbeat_seconds = task_status_interval_seconds
+    timeout_minutes = int((int(runtime.get("timeout_seconds") or 0) + 59) / 60)
+    recent_default = int(runtime.get("recent_default_count") or 5)
+    rows = [
+        {
+            "buttons": [
+                keyboard_button("超时设置", "/timeout", button_id="setup-timeout", style=0),
+                keyboard_button("任务提醒频率", "/heartbeat", button_id="setup-heartbeat", style=0),
+            ]
+        },
+        {
+            "buttons": [
+                keyboard_button("最近对话默认条数", "/recent-default", button_id="setup-recent-default", style=0),
+                keyboard_button("权限设置", "/permission", button_id="setup-permission", style=0),
+            ]
+        },
+        {
+            "buttons": [
+                keyboard_button(
+                    "关闭阶段性输出" if partial_on else "开启阶段性输出",
+                    "/output stage off" if partial_on else "/output stage on",
+                    button_id="setup-stage-output-toggle",
+                    style=1 if partial_on else 0,
+                ),
+                keyboard_button(
+                    "关闭最终输出带用户输入" if context_on else "开启最终输出带用户输入",
+                    "/output userContext off" if context_on else "/output userContext on",
+                    button_id="setup-user-context-toggle",
+                    style=1 if context_on else 0,
+                ),
+            ]
+        },
+        {
+            "buttons": [
+                keyboard_button(
+                    "关闭长内容截断" if truncate_on else "开启长内容截断",
+                    "/truncate off" if truncate_on else "/truncate on",
+                    button_id="setup-truncate-toggle",
+                    style=1 if truncate_on else 0,
+                ),
+            ]
+        },
+    ]
+    return {
+        "markdown": "\n".join([
+            "设置",
+            f"超时设置：{timeout_minutes} 分钟",
+            f"任务提醒频率：{format_duration(heartbeat_seconds)}",
+            f"最近对话默认条数：{recent_default}",
+            f"阶段性输出：{'开' if partial_on else '关'}",
+            f"最终输出带用户输入：{'开' if context_on else '关'}",
+            f"长内容截断：{'开' if truncate_on else '关'}",
+            "权限设置",
+            "",
+            "命令：",
+            "/timeout - 超时设置",
+            "/heartbeat - 任务提醒频率",
+            "/recent-default - 最近对话默认条数",
+            "/output stage on|off - 开关阶段性输出",
+            "/output userContext on|off - 开关最终输出带用户输入",
+            "/truncate on|off - 开关长内容截断",
+            "/permission - 权限设置",
+        ]),
+        "keyboard": {"rows": rows},
+    }
+
+
+def build_timeout_card() -> Dict[str, Any]:
+    runtime = current_runtime()
+    timeout_minutes = int((int(runtime.get("timeout_seconds") or 0) + 59) / 60)
+    buttons = [
+        keyboard_button("15分钟", "/timeout 15", button_id="timeout-15", style=1 if timeout_minutes == 15 else 0),
+        keyboard_button("30分钟", "/timeout 30", button_id="timeout-30", style=1 if timeout_minutes == 30 else 0),
+        keyboard_button("1小时", "/timeout 60", button_id="timeout-60", style=1 if timeout_minutes == 60 else 0),
+        keyboard_button("5小时", "/timeout 300", button_id="timeout-300", style=1 if timeout_minutes == 300 else 0),
+        keyboard_button("24小时", "/timeout 1440", button_id="timeout-1440", style=1 if timeout_minutes == 1440 else 0),
+    ]
+    return {
+        "markdown": "\n".join([
+            "超时设置",
+            f"当前超时：{timeout_minutes} 分钟",
+            "也可以手动发送 /timeout 分钟数。",
+        ]),
+        "keyboard": {"rows": [{"buttons": row} for row in chunked(buttons, 2)]},
+    }
+
+
+def build_permission_card() -> Dict[str, Any]:
+    runtime = current_runtime()
+    permission = str(runtime.get("permission") or "")
+    buttons = [
+        keyboard_button("只读", "/permission read only", button_id="permission-read", style=1 if permission == "read-only" else 0),
+        keyboard_button("请求批准", "/permission ask", button_id="permission-ask", style=1 if permission == "ask" else 0),
+        keyboard_button("替我审批", "/permission auto", button_id="permission-auto", style=1 if permission == "auto" else 0),
+        keyboard_button("完全权限", "/permission full", button_id="permission-full", style=1 if permission == "full" else 0),
+    ]
+    return {
+        "markdown": "\n".join([
+            "权限设置",
+            f"当前权限：{runtime.get('permission_profile', {}).get('label', permission)}",
+            "请求批准会先把普通任务发给你确认；替我审批使用 Codex 自动审批审查；完全权限风险最高。",
+            "点击按钮即可切换。",
+        ]),
+        "keyboard": {"rows": [{"buttons": row} for row in chunked(buttons, 2)]},
+    }
+
+
+def build_heartbeat_card() -> Dict[str, Any]:
+    with task_output_settings_lock:
+        current = task_status_interval_seconds
+    options = [
+        ("关闭", 0),
+        ("1分钟", 60),
+        ("5分钟", 300),
+        ("10分钟", 600),
+        ("30分钟", 1800),
+    ]
+    buttons = [
+        keyboard_button(label, f"/heartbeat {seconds // 60}" if seconds else "/heartbeat off", button_id=f"heartbeat-{seconds}", style=1 if current == seconds else 0)
+        for label, seconds in options
+    ]
+    return {
+        "markdown": "\n".join([
+            "任务提醒频率",
+            f"当前频率：{'关' if current <= 0 else format_duration(current)}",
+            "也可以手动发送 /heartbeat 分钟数，发送 /heartbeat off 可关闭。",
+        ]),
+        "keyboard": {"rows": [{"buttons": row} for row in chunked(buttons, 2)]},
+    }
+
+
+def build_recent_default_card() -> Dict[str, Any]:
+    runtime = current_runtime()
+    current = int(runtime.get("recent_default_count") or 5)
+    buttons = [
+        keyboard_button("5条", "/recent-default 5", button_id="recent-default-5", style=1 if current == 5 else 0),
+        keyboard_button("10条", "/recent-default 10", button_id="recent-default-10", style=1 if current == 10 else 0),
+        keyboard_button("15条", "/recent-default 15", button_id="recent-default-15", style=1 if current == 15 else 0),
+        keyboard_button("20条", "/recent-default 20", button_id="recent-default-20", style=1 if current == 20 else 0),
+    ]
+    return {
+        "markdown": "\n".join([
+            "最近对话默认条数",
+            f"当前默认：{current} 条",
+            "影响 /recent 和 /last user/codex 不带数量时的默认展示条数。",
+        ]),
+        "keyboard": {"rows": [{"buttons": row} for row in chunked(buttons, 2)]},
+    }
+
+
+def build_truncate_card() -> Dict[str, Any]:
+    with task_output_settings_lock:
+        enabled = truncate_long_replies
+    return {
+        "markdown": "\n".join([
+            "长内容截断",
+            f"当前状态：{'开' if enabled else '关'}",
+            "开启时超长回复会按最大分片数截断；关闭时会尽量分段发送完整内容。",
+        ]),
+        "keyboard": {
+            "rows": [
+                {
+                    "buttons": [
+                        keyboard_button("开启长内容截断", "/truncate on", button_id="truncate-on", style=1 if enabled else 0),
+                        keyboard_button("关闭长内容截断", "/truncate off", button_id="truncate-off", style=0 if enabled else 1),
+                    ]
+                }
+            ]
+        },
     }
 
 
@@ -815,20 +1032,20 @@ def send_startup_start_messages(api: "QQApi") -> None:
 
 def build_recent_card() -> Dict[str, Any]:
     return {
-        "markdown": "选择要查看的会话内容范围。也可以手动发送 /recent N，N=1-10。",
+        "markdown": "选择要查看的会话内容范围。也可以手动发送 /recent N S，N=1-20，S 为从最近第几条开始。",
         "keyboard": {
             "rows": [
                 {
                     "buttons": [
-                        keyboard_button("最近4条", "/recent", button_id="recent-4", style=1),
-                        keyboard_button("最近3条", "/recent 3", button_id="recent-3", style=1),
+                        keyboard_button("最近5条", "/recent", button_id="recent-5", style=1),
                         keyboard_button("最近10条", "/recent 10", button_id="recent-10", style=0),
+                        keyboard_button("最近20条", "/recent 20", button_id="recent-20", style=0),
                     ]
                 },
                 {
                     "buttons": [
-                        keyboard_button("我上一句", "/last user", button_id="recent-last-user", style=0),
-                        keyboard_button("Codex上一句", "/last codex", button_id="recent-last-codex", style=0),
+                        keyboard_button("我最近5句", "/last user", button_id="recent-last-user", style=0),
+                        keyboard_button("Codex最近5句", "/last codex", button_id="recent-last-codex", style=0),
                     ]
                 },
                 {
@@ -836,6 +1053,36 @@ def build_recent_card() -> Dict[str, Any]:
                         keyboard_button("会话列表", "/resume", button_id="recent-resume", style=0),
                     ]
                 },
+            ]
+        },
+    }
+
+
+def recent_nav_card(command: str, args: str) -> Optional[Dict[str, Any]]:
+    if command not in {"/recent", "/last"}:
+        return None
+    tokens = (args or "").split()
+    mode = ""
+    rest = tokens
+    if command == "/last" and tokens and not re.fullmatch(r"\d+", tokens[0]):
+        mode = tokens[0]
+        rest = tokens[1:]
+    numbers = [int(token) for token in rest if re.fullmatch(r"\d+", token)]
+    count = max(1, min(20, numbers[0] if numbers else 5))
+    start = max(1, numbers[1] if len(numbers) > 1 else 1)
+    previous_start = start + count
+    next_start = max(1, start - count)
+    prefix = command if command == "/recent" else f"/last {mode or 'codex'}"
+    return {
+        "markdown": "翻阅聊天记录",
+        "keyboard": {
+            "rows": [
+                {
+                    "buttons": [
+                        keyboard_button(f"前{count}条", f"{prefix} {count} {previous_start}", button_id=f"recent-prev-{command.strip('/')}-{count}-{previous_start}", style=0),
+                        keyboard_button(f"后{count}条", f"{prefix} {count} {next_start}", button_id=f"recent-next-{command.strip('/')}-{count}-{next_start}", style=0),
+                    ]
+                }
             ]
         },
     }
@@ -858,18 +1105,56 @@ def build_resume_switched_card(session_id: str) -> Dict[str, Any]:
                 },
                 {
                     "buttons": [
-                        keyboard_button("最近3条", "/recent 3", button_id=f"resume-recent3-{short}", style=0),
+                        keyboard_button("最近5条", "/recent 5", button_id=f"resume-recent5-{short}", style=0),
                         keyboard_button("最近10条", "/recent 10", button_id=f"resume-recent10-{short}", style=0),
                     ]
                 },
                 {
                     "buttons": [
-                        keyboard_button("我上一句", "/last user", button_id=f"resume-last-user-{short}", style=0),
-                        keyboard_button("Codex上一句", "/last codex", button_id=f"resume-last-codex-{short}", style=0),
+                        keyboard_button("我最近5句", "/last user", button_id=f"resume-last-user-{short}", style=0),
+                        keyboard_button("Codex最近5句", "/last codex", button_id=f"resume-last-codex-{short}", style=0),
                     ]
                 },
             ]
         },
+    }
+
+
+def build_task_queued_card(task_id: str) -> Dict[str, Any]:
+    short = short_task_id(task_id)
+    return {
+        "markdown": f"任务已加入队列：{task_id}",
+        "keyboard": {
+            "rows": [
+                {
+                    "buttons": [
+                        keyboard_button("查看任务队列", "/tasks", button_id=f"tasks-{short}", style=1),
+                        keyboard_button("取消当前任务", f"/cancel {task_id}", button_id=f"cancel-task-{short}", style=0),
+                    ]
+                }
+            ]
+        },
+    }
+
+
+def build_tasks_card() -> Optional[Dict[str, Any]]:
+    with task_lock:
+        active = [
+            item for item in tasks.values()
+            if item.get("status") in {"queued", "queued-session", "queued-capacity", "running"}
+        ]
+    if not active:
+        return None
+    order = {"running": 0, "queued-capacity": 1, "queued-session": 2, "queued": 3}
+    active.sort(key=lambda item: (order.get(str(item.get("status")), 9), float(item.get("created_at", 0))))
+    buttons = []
+    for item in active[:6]:
+        task_id = str(item.get("id", ""))
+        if task_id:
+            buttons.append(keyboard_button(f"取消{task_id}", f"/cancel {task_id}", button_id=f"tasks-cancel-{short_task_id(task_id)}", style=0))
+    return {
+        "markdown": "任务操作",
+        "keyboard": {"rows": [{"buttons": row} for row in chunked(buttons, 2)]},
     }
 
 
@@ -908,6 +1193,48 @@ def build_approval_card(item: Dict[str, Any]) -> Dict[str, Any]:
         "markdown": markdown,
         "keyboard": {"rows": rows},
     }
+
+
+def build_pending_approvals_card() -> Optional[Dict[str, Any]]:
+    from codex_bridge_client import list_pending_approvals
+
+    items = list_pending_approvals()
+    buttons = []
+    for item in items[:6]:
+        item_id = str(item.get("id", "")).strip()
+        if item_id:
+            buttons.append(keyboard_button(f"批准{item_id}", f"/allow {item_id}", button_id=f"pending-allow-{item_id}", style=1))
+            buttons.append(keyboard_button(f"拒绝{item_id}", f"/reject {item_id}", button_id=f"pending-reject-{item_id}", style=0))
+    if not buttons:
+        return None
+    return {
+        "markdown": "待批准操作",
+        "keyboard": {"rows": [{"buttons": row} for row in chunked(buttons, 2)]},
+    }
+
+
+def send_approval_item(api: "QQApi", reply: Dict[str, str], item: Dict[str, Any], seq: int) -> int:
+    card = build_approval_card(item)
+    try:
+        api.send_markdown_keyboard(reply, card["markdown"], card["keyboard"], seq)
+        print(f"[qq-send-approval-card] id={item.get('id')}", flush=True)
+        return seq + 1
+    except Exception as exc:
+        print(f"[qq-send-approval-card-error] {exc}", flush=True)
+    try:
+        api.send_message(reply, approval_prompt_text(item), seq)
+        print(f"[qq-send-approval-text] id={item.get('id')}", flush=True)
+        return seq + 1
+    except Exception as exc:
+        print(f"[qq-send-approval-text-error] {exc}", flush=True)
+    return seq
+
+
+def send_approval_test(api: "QQApi", job: Dict[str, Any], seq: int) -> int:
+    test_job = dict(job)
+    test_job["text"] = "审批测试：这是一条测试待批准请求，不会执行真实任务。"
+    item = create_pending_approval(test_job)
+    return send_approval_item(api, job["reply"], item, seq)
 
 
 def http_json(method: str, url: str, payload: Optional[Dict[str, Any]] = None,
@@ -1185,10 +1512,10 @@ def extract_job(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
-def split_reply(text: str, max_chars: int, max_chunks: int) -> List[str]:
+def split_reply(text: str, max_chars: int, max_chunks: int, truncate: bool = True) -> List[str]:
     text = (text or "").strip() or "(Codex returned an empty response.)"
     parts = [text[index:index + max_chars] for index in range(0, len(text), max_chars)]
-    if len(parts) <= max_chunks:
+    if len(parts) <= max_chunks or not truncate:
         return parts
 
     parts = parts[:max_chunks]
@@ -1207,7 +1534,9 @@ def send_text_and_images(
 ) -> int:
     clean_text, image_paths = parse_outbound_images(text)
     seq = msg_seq
-    chunks = split_reply(clean_text, QQ_REPLY_MAX_CHARS, max_chunks) if clean_text.strip() else []
+    with task_output_settings_lock:
+        truncate = truncate_long_replies
+    chunks = split_reply(clean_text, QQ_REPLY_MAX_CHARS, max_chunks, truncate) if clean_text.strip() else []
     if not chunks and not image_paths:
         chunks = ["(Codex returned an empty response.)"]
 
@@ -1262,6 +1591,8 @@ def format_duration(seconds: float) -> str:
     if hours:
         return f"{hours}h{minutes:02d}m"
     if minutes:
+        if sec == 0:
+            return f"{minutes}m"
         return f"{minutes}m{sec:02d}s"
     return f"{sec}s"
 
@@ -1300,6 +1631,25 @@ def tasks_text() -> str:
         lines.append(f"- {item.get('id')} | {label} | {age} | session={str(item.get('session_key', ''))[-12:]} | {title}")
     lines.append("用法：/cancel <task_id> 取消指定任务。")
     return "\n".join(lines)
+
+
+def task_prompt_preview(text: str, limit: int = 240) -> str:
+    preview = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(preview) > limit:
+        preview = preview[:limit].rstrip() + "..."
+    return preview or "(空)"
+
+
+def final_task_answer_text(task_id: str, job: Dict[str, Any], answer: str) -> str:
+    with task_output_settings_lock:
+        enabled = show_task_context_on_final
+    if not enabled:
+        return answer
+    return "\n\n".join([
+        f"任务 {task_id} 的最终输出",
+        f"用户输入：{task_prompt_preview(str(job.get('text', '')))}",
+        answer,
+    ])
 
 
 def extract_agent_message(event: Dict[str, Any]) -> str:
@@ -1342,6 +1692,10 @@ def cleanup_finished_tasks(max_age_seconds: int = 3600) -> None:
 
 def task_event_callback(task_id: str, api: QQApi, reply: Dict[str, str]):
     def on_event(event: Dict[str, Any]) -> None:
+        with task_output_settings_lock:
+            partial_enabled = send_partial_outputs
+        if not partial_enabled:
+            return
         message = extract_agent_message(event)
         if not message:
             return
@@ -1376,7 +1730,13 @@ def task_event_callback(task_id: str, api: QQApi, reply: Dict[str, str]):
 
 
 def task_status_loop(task_id: str, api: QQApi, reply: Dict[str, str], stop_event: threading.Event) -> None:
-    while not stop_event.wait(QQ_TASK_STATUS_INTERVAL_SECONDS):
+    while True:
+        with task_output_settings_lock:
+            interval = task_status_interval_seconds
+        if interval <= 0:
+            return
+        if stop_event.wait(interval):
+            return
         with task_lock:
             item = tasks.get(task_id)
             if not item or item.get("status") != "running":
@@ -1428,7 +1788,8 @@ def run_task(task_id: str, api: QQApi) -> None:
                     seq = int(item.get("next_seq", 2)) if item else 2
                     if item:
                         item["next_seq"] = seq + 1
-                send_text_and_images(api, reply, answer, seq, QQ_MAX_REPLY_CHUNKS, "qq-send-answer")
+                final_answer = final_task_answer_text(task_id, job, answer)
+                send_text_and_images(api, reply, final_answer, seq, QQ_MAX_REPLY_CHUNKS, "qq-send-answer")
                 update_task(task_id, status="done", ended_at=time.time())
             except Exception as exc:
                 answer = f"Codex 调用失败：{exc}"
@@ -1467,10 +1828,16 @@ def enqueue_codex_task(api: QQApi, job: Dict[str, Any], first_seq: int) -> None:
             "next_seq": first_seq + 1,
         }
         ahead = sum(1 for item in tasks.values() if item.get("status") in {"queued", "queued-session", "queued-capacity"})
+    queue_text = f"已加入 Codex 任务队列：{task_id}\n排队中：{ahead} 个。"
     try:
-        api.send_message(job["reply"], f"已加入 Codex 任务队列：{task_id}\n排队中：{ahead} 个。/tasks 查看，/cancel {task_id} 取消。", first_seq)
+        card = build_task_queued_card(task_id)
+        api.send_markdown_keyboard(job["reply"], queue_text + "\n\n" + card["markdown"], card["keyboard"], first_seq)
     except Exception as exc:
-        print(f"[task-queued-send-error] id={task_id} {exc}", flush=True)
+        print(f"[task-queued-card-error] id={task_id} {exc}", flush=True)
+        try:
+            api.send_message(job["reply"], f"{queue_text}\n/tasks 查看，/cancel {task_id} 取消。", first_seq)
+        except Exception as send_exc:
+            print(f"[task-queued-send-error] id={task_id} {send_exc}", flush=True)
     threading.Thread(target=run_task, args=(task_id, api), name=f"codex-task-{task_id}", daemon=True).start()
 
 
@@ -1488,6 +1855,18 @@ def command_card(text: str) -> Optional[Dict[str, Any]]:
     command, args = split_command(text)
     if command == "/start":
         return build_start_card()
+    if command == "/setup":
+        return build_setup_card()
+    if command == "/timeout" and not args.strip():
+        return build_timeout_card()
+    if command == "/permission" and not args.strip():
+        return build_permission_card()
+    if command == "/heartbeat" and not args.strip():
+        return build_heartbeat_card()
+    if command == "/recent-default" and not args.strip():
+        return build_recent_default_card()
+    if command == "/truncate" and not args.strip():
+        return build_truncate_card()
     if command == "/resume":
         parsed = parse_resume_args(args)
         if parsed["mode"] in {"groups", "sessions"}:
@@ -1497,10 +1876,100 @@ def command_card(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def output_settings_text(args: str) -> str:
+    global send_partial_outputs, show_task_context_on_final
+    normalized = re.sub(r"\s+", " ", (args or "").strip().lower())
+    with task_output_settings_lock:
+        if normalized in {"on", "stage on", "partial on", "partials on", "阶段性 on", "阶段性 开"}:
+            send_partial_outputs = True
+        elif normalized in {"off", "stage off", "partial off", "partials off", "阶段性 off", "阶段性 关"}:
+            send_partial_outputs = False
+        elif normalized in {"stage", "partial", "partials", "阶段性"}:
+            pass
+        elif normalized in {"usercontext on", "user context on", "用户输入 on", "用户输入 开", "最终输出 on", "最终输出 开"}:
+            show_task_context_on_final = True
+        elif normalized in {"usercontext off", "user context off", "用户输入 off", "用户输入 关", "最终输出 off", "最终输出 关"}:
+            show_task_context_on_final = False
+        elif normalized in {"usercontext", "user context", "用户输入", "最终输出"}:
+            pass
+        elif normalized:
+            return "无法识别设置。用法：/output stage on|off 或 /output userContext on|off"
+        partial_text = "开" if send_partial_outputs else "关"
+        final_text = "开" if show_task_context_on_final else "关"
+    return "\n".join([
+        "输出设置",
+        f"阶段性输出：{partial_text}",
+        f"最终输出带用户输入：{final_text}",
+        "用法：",
+        "/output stage on - 开启阶段性输出",
+        "/output stage off - 关闭阶段性输出",
+        "/output userContext on - 最终输出带用户输入",
+        "/output userContext off - 最终输出不带用户输入",
+    ])
+
+
+def heartbeat_settings_text(args: str) -> str:
+    global task_status_interval_seconds
+    normalized = re.sub(r"\s+", " ", (args or "").strip().lower())
+    changed = False
+    with task_output_settings_lock:
+        if normalized in {"off", "0", "关", "关闭"}:
+            task_status_interval_seconds = 0
+            changed = True
+        elif normalized:
+            match = re.search(r"\d+", normalized)
+            if not match:
+                return "无法识别任务提醒频率。用法：/heartbeat 5 或 /heartbeat off"
+            minutes = max(1, min(1440, int(match.group(0))))
+            task_status_interval_seconds = minutes * 60
+            changed = True
+        current = task_status_interval_seconds
+    if changed:
+        save_runtime_setting("task_status_interval_seconds", current)
+    return "\n".join([
+        "任务提醒频率",
+        f"当前频率：{'关' if current <= 0 else format_duration(current)}",
+        "用法：",
+        "/heartbeat 5 - 每 5 分钟提醒一次",
+        "/heartbeat off - 关闭任务运行提醒",
+    ])
+
+
+def truncate_settings_text(args: str) -> str:
+    global truncate_long_replies
+    normalized = re.sub(r"\s+", " ", (args or "").strip().lower())
+    changed = False
+    with task_output_settings_lock:
+        if normalized in {"on", "开", "开启", "true", "1"}:
+            truncate_long_replies = True
+            changed = True
+        elif normalized in {"off", "关", "关闭", "false", "0"}:
+            truncate_long_replies = False
+            changed = True
+        elif normalized:
+            return "无法识别长内容截断设置。用法：/truncate on|off"
+        enabled = truncate_long_replies
+    if changed:
+        save_runtime_setting("truncate_long_replies", enabled)
+    return "\n".join([
+        "长内容截断",
+        f"当前状态：{'开' if enabled else '关'}",
+        "用法：",
+        "/truncate on - 超长回复按最大分片数截断",
+        "/truncate off - 超长回复尽量分段发完整",
+    ])
+
+
 def local_gateway_command_reply(text: str) -> Optional[str]:
     command, args = split_command(text)
     if command == "/tasks":
         return tasks_text()
+    if command == "/output":
+        return output_settings_text(args)
+    if command == "/heartbeat":
+        return heartbeat_settings_text(args)
+    if command == "/truncate":
+        return truncate_settings_text(args)
     if command == "/cancel":
         target = args.strip()
         if target:
@@ -1516,7 +1985,7 @@ def local_gateway_command_reply(text: str) -> Optional[str]:
 
 
 def post_command_card(text: str, command_reply: str) -> Optional[Dict[str, Any]]:
-    command, _ = split_command(text)
+    command, args = split_command(text)
     if command == "/resume" and command_reply.startswith("已切换到 Codex 原生会话："):
         first_line = command_reply.splitlines()[0]
         _, _, session_id = first_line.partition("：")
@@ -1524,7 +1993,23 @@ def post_command_card(text: str, command_reply: str) -> Optional[Dict[str, Any]]
         if re.fullmatch(r"[A-Za-z0-9_.-]{4,120}", session_id):
             return build_resume_switched_card(session_id)
     if command in {"/recent", "/last"} and not command_reply.startswith("当前没有 active"):
-        return build_recent_card()
+        return recent_nav_card(command, args)
+    if command == "/tasks":
+        return build_tasks_card()
+    if command == "/pending":
+        return build_pending_approvals_card()
+    if command == "/timeout":
+        return build_timeout_card()
+    if command == "/permission":
+        return build_permission_card()
+    if command == "/heartbeat":
+        return build_heartbeat_card()
+    if command == "/recent-default":
+        return build_recent_default_card()
+    if command == "/truncate":
+        return build_truncate_card()
+    if command == "/output":
+        return build_setup_card()
     return None
 
 
@@ -1544,7 +2029,9 @@ def send_command_reply(api: QQApi, reply: Dict[str, str], text: str, msg_seq: in
         return msg_seq
 
     seq = msg_seq
-    for part in split_reply(command_reply, QQ_REPLY_MAX_CHARS, QQ_MAX_REPLY_CHUNKS):
+    with task_output_settings_lock:
+        truncate = truncate_long_replies
+    for part in split_reply(command_reply, QQ_REPLY_MAX_CHARS, QQ_MAX_REPLY_CHUNKS, truncate):
         try:
             api.send_message(reply, part, seq)
             seq += 1
@@ -1590,6 +2077,11 @@ def worker_loop(api: QQApi, jobs: "queue.Queue[Dict[str, Any]]", stop_event: thr
             seq = send_command_reply(api, job["reply"], "/start", seq)
             print(f"[qq-send-auto-start] event={job['event_type']} from={job['from']}", flush=True)
 
+        if command_name == "/approval-test":
+            send_approval_test(api, job, seq)
+            jobs.task_done()
+            continue
+
         if command_name in {"/allow", "/revise"} and QQ_SEND_PROCESSING_MESSAGE:
             status_text = "收到，正在执行已批准操作。" if command_name == "/allow" else "收到，正在重新生成审批计划。"
             try:
@@ -1612,7 +2104,9 @@ def worker_loop(api: QQApi, jobs: "queue.Queue[Dict[str, Any]]", stop_event: thr
                 except Exception as exc:
                     print(f"[qq-send-card-error] {exc}", flush=True)
 
-            for part in split_reply(command_reply, QQ_REPLY_MAX_CHARS, QQ_MAX_REPLY_CHUNKS):
+            with task_output_settings_lock:
+                truncate = truncate_long_replies
+            for part in split_reply(command_reply, QQ_REPLY_MAX_CHARS, QQ_MAX_REPLY_CHUNKS, truncate):
                 try:
                     api.send_message(job["reply"], part, seq)
                     print(f"[qq-send-command] event={job['event_type']} chars={len(part)}", flush=True)
@@ -1632,28 +2126,9 @@ def worker_loop(api: QQApi, jobs: "queue.Queue[Dict[str, Any]]", stop_event: thr
             jobs.task_done()
             continue
 
-        if QQ_SEND_PROCESSING_MESSAGE and QQ_PROCESSING_TEXT:
-            try:
-                api.send_message(job["reply"], QQ_PROCESSING_TEXT, seq)
-                seq += 1
-            except Exception as exc:
-                print(f"[qq-send-processing-error] {exc}", flush=True)
-
         pending_item = prepare_bridge_approval(job)
         if pending_item is not None:
-            card = build_approval_card(pending_item)
-            try:
-                api.send_markdown_keyboard(job["reply"], card["markdown"], card["keyboard"], seq)
-                print(f"[qq-send-approval-card] event={job['event_type']} id={pending_item.get('id')}", flush=True)
-                jobs.task_done()
-                continue
-            except Exception as exc:
-                print(f"[qq-send-approval-card-error] {exc}", flush=True)
-            try:
-                api.send_message(job["reply"], approval_prompt_text(pending_item), seq)
-                print(f"[qq-send-approval-text] event={job['event_type']} id={pending_item.get('id')}", flush=True)
-            except Exception as exc:
-                print(f"[qq-send-approval-text-error] {exc}", flush=True)
+            send_approval_item(api, job["reply"], pending_item, seq)
             jobs.task_done()
             continue
 

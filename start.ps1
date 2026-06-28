@@ -295,6 +295,21 @@ function Resolve-PythonCommand {
         } catch {
         }
     }
+    if (Test-Command "conda") {
+        try {
+            $condaBase = (& conda info --base 2>$null).Trim()
+            if ($LASTEXITCODE -eq 0 -and $condaBase) {
+                $condaPython = Join-Path $condaBase "python.exe"
+                if (Test-Path -LiteralPath $condaPython) {
+                    $version = & $condaPython --version 2>&1
+                    if ($LASTEXITCODE -eq 0 -and "$version" -match "Python\s+3\.") {
+                        return @($condaPython)
+                    }
+                }
+            }
+        } catch {
+        }
+    }
     return @()
 }
 
@@ -329,6 +344,31 @@ function Invoke-PythonLogged {
         -ArgumentList ($baseArgs + $Arguments) `
         -WorkingDirectory $WorkingDirectory `
         -Activity $Activity
+}
+
+function Invoke-PythonCapture {
+    param(
+        [string[]]$PythonCommand,
+        [string[]]$Arguments,
+        [string]$WorkingDirectory = $PSScriptRoot
+    )
+    $exe = $PythonCommand[0]
+    $baseArgs = Get-TailArgs -Command $PythonCommand
+    Push-Location -LiteralPath $WorkingDirectory
+    try {
+        $output = & $exe @baseArgs @Arguments 2>&1
+        return [pscustomobject]@{
+            ExitCode = $LASTEXITCODE
+            Output = ($output -join "`n")
+        }
+    } catch {
+        return [pscustomobject]@{
+            ExitCode = 1
+            Output = $_.Exception.Message
+        }
+    } finally {
+        Pop-Location
+    }
 }
 
 function Ensure-WingetPackage {
@@ -593,6 +633,7 @@ function Write-EnvFile {
         "CODEX_CONTEXT_MODE=$(Get-EnvValue -Map $Existing -Key 'CODEX_CONTEXT_MODE' -DefaultValue 'native')",
         "CODEX_ALLOWED_MODELS=$(Get-EnvValue -Map $Existing -Key 'CODEX_ALLOWED_MODELS' -DefaultValue 'gpt-5.5,gpt-5.4')",
         "CODEX_TIMEOUT_SECONDS=$(Get-EnvValue -Map $Existing -Key 'CODEX_TIMEOUT_SECONDS' -DefaultValue '1800')",
+        "RECENT_DEFAULT_COUNT=$(Get-EnvValue -Map $Existing -Key 'RECENT_DEFAULT_COUNT' -DefaultValue '5')",
         "MAX_HISTORY_CHARS=$(Get-EnvValue -Map $Existing -Key 'MAX_HISTORY_CHARS' -DefaultValue '12000')",
         "",
         "# QQ official Gateway mode.",
@@ -609,11 +650,14 @@ function Write-EnvFile {
         "QQ_MAX_REPLY_CHUNKS=$(Get-EnvValue -Map $Existing -Key 'QQ_MAX_REPLY_CHUNKS' -DefaultValue '5')",
         "QQ_JOB_QUEUE_SIZE=$(Get-EnvValue -Map $Existing -Key 'QQ_JOB_QUEUE_SIZE' -DefaultValue '20')",
         "QQ_CODEX_MAX_PARALLEL=$(Get-EnvValue -Map $Existing -Key 'QQ_CODEX_MAX_PARALLEL' -DefaultValue '5')",
-        "QQ_TASK_STATUS_INTERVAL_SECONDS=$(Get-EnvValue -Map $Existing -Key 'QQ_TASK_STATUS_INTERVAL_SECONDS' -DefaultValue '60')",
+        "QQ_TASK_STATUS_INTERVAL_SECONDS=$(Get-EnvValue -Map $Existing -Key 'QQ_TASK_STATUS_INTERVAL_SECONDS' -DefaultValue '300')",
         "QQ_TASK_PARTIAL_INTERVAL_SECONDS=$(Get-EnvValue -Map $Existing -Key 'QQ_TASK_PARTIAL_INTERVAL_SECONDS' -DefaultValue '60')",
         "QQ_TASK_PARTIAL_MAX_CHARS=$(Get-EnvValue -Map $Existing -Key 'QQ_TASK_PARTIAL_MAX_CHARS' -DefaultValue '1200')",
-        "QQ_SEND_PROCESSING_MESSAGE=$(Get-EnvValue -Map $Existing -Key 'QQ_SEND_PROCESSING_MESSAGE' -DefaultValue '1')",
-        "QQ_PROCESSING_TEXT=$(Get-EnvValue -Map $Existing -Key 'QQ_PROCESSING_TEXT' -DefaultValue 'Received, processing.')",
+        "QQ_SEND_PARTIAL_OUTPUTS=$(Get-EnvValue -Map $Existing -Key 'QQ_SEND_PARTIAL_OUTPUTS' -DefaultValue '0')",
+        "QQ_SHOW_TASK_CONTEXT_ON_FINAL=$(Get-EnvValue -Map $Existing -Key 'QQ_SHOW_TASK_CONTEXT_ON_FINAL' -DefaultValue '1')",
+        "QQ_TRUNCATE_LONG_REPLIES=$(Get-EnvValue -Map $Existing -Key 'QQ_TRUNCATE_LONG_REPLIES' -DefaultValue '1')",
+        "QQ_SEND_PROCESSING_MESSAGE=$(Get-EnvValue -Map $Existing -Key 'QQ_SEND_PROCESSING_MESSAGE' -DefaultValue '0')",
+        "QQ_PROCESSING_TEXT=$(Get-EnvValue -Map $Existing -Key 'QQ_PROCESSING_TEXT' -DefaultValue '')",
         "QQ_SEND_STARTUP_TO_ALLOWED_USERS=$(Get-EnvValue -Map $Existing -Key 'QQ_SEND_STARTUP_TO_ALLOWED_USERS' -DefaultValue '1')",
         "QQ_ATTACHMENT_DOWNLOAD=$(Get-EnvValue -Map $Existing -Key 'QQ_ATTACHMENT_DOWNLOAD' -DefaultValue '1')",
         "QQ_ATTACHMENT_MAX_COUNT=$(Get-EnvValue -Map $Existing -Key 'QQ_ATTACHMENT_MAX_COUNT' -DefaultValue '4')",
@@ -843,10 +887,16 @@ function Show-QuickStartHelp {
     Write-Host "  /whoami                       显示当前 QQ Gateway openid"
     Write-Host "  /model                        显示当前模型和思考强度"
     Write-Host "  /model gpt-5.5 high           设置模型和思考强度"
+    Write-Host "  /setup                        显示设置面板"
     Write-Host "  /permission                   显示权限模式"
     Write-Host "  /timeout 45                   设置单次 Codex 调用超时为 45 分钟"
+    Write-Host "  /heartbeat 5                  设置任务运行提醒频率为 5 分钟"
+    Write-Host "  /truncate on/off              开关长内容截断"
+    Write-Host "  /recent-default 10            设置最近对话默认展示 10 条"
     Write-Host "  /permission read only         使用只读模式"
-    Write-Host "  /permission ask               高风险操作前请求批准"
+    Write-Host "  /permission ask               请求批准"
+    Write-Host "  /permission auto              替我审批"
+    Write-Host "  /permission full              完全访问权限"
     Write-Host "  /pending                      显示待批准操作"
     Write-Host "  /allow <id>                   批准待执行操作"
     Write-Host "  /cancel                       取消当前 Codex 任务"
@@ -1011,13 +1061,20 @@ $codexCommand = Ensure-CodexCli
 Ensure-EnvConfig -EnvPath $envPath -CodexCommand $codexCommand -DefaultWorkdir $WorkDir
 
 Write-Step "验证 Python 文件和本地命令"
-$compileExit = Invoke-Python -PythonCommand $python -Arguments @("-m", "py_compile", "codex_bridge_client.py", "qq_gateway_client.py", "qq_gateway_background.py") -WorkingDirectory $clientDir
-if ($compileExit -ne 0) {
+$compileCheck = Invoke-PythonCapture -PythonCommand $python -Arguments @("-m", "py_compile", "codex_bridge_client.py", "qq_gateway_client.py", "qq_gateway_background.py") -WorkingDirectory $clientDir
+if ($compileCheck.ExitCode -ne 0) {
+    if ($compileCheck.Output) {
+        Write-Host $compileCheck.Output -ForegroundColor Red
+    }
     throw "Python 文件编译检查失败，请查看上方错误。"
 }
-$statusExit = Invoke-Python -PythonCommand $python -Arguments @("-c", "from codex_bridge_client import handle_bridge_command; print(handle_bridge_command('/status'))") -WorkingDirectory $clientDir
-if ($statusExit -ne 0) {
-    throw "本地 /status 命令检查失败，请查看上方错误。"
+$commandCheckCode = "from codex_bridge_client import handle_bridge_command; result = handle_bridge_command('/help'); assert isinstance(result, str) and '/help' in result"
+$commandCheck = Invoke-PythonCapture -PythonCommand $python -Arguments @("-c", $commandCheckCode) -WorkingDirectory $clientDir
+if ($commandCheck.ExitCode -ne 0) {
+    if ($commandCheck.Output) {
+        Write-Host $commandCheck.Output -ForegroundColor Red
+    }
+    throw "本地命令处理检查失败，请查看上方错误。"
 }
 Write-Ok "本地验证通过"
 

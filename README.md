@@ -37,7 +37,82 @@ CODEX_CONTEXT_MODE=native
 CODEX_CONTEXT_MODE=prompt
 ```
 
-### 安装
+### Windows 一键部署（推荐）
+
+项目根目录的 `start.ps1` 会按顺序检查 Python、`websocket-client`、Codex CLI、Node.js/npm 和本地配置。缺少组件时，脚本会先询问用户，确认后再自动安装。
+
+首次建议先运行仅检查模式：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -CheckOnly
+```
+
+确认配置无误后前台启动：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1
+```
+
+后台启动：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Background
+```
+
+后台模式默认启动隐藏的后台守护进程，不显示 Windows 托盘图标。
+
+如果需要在 Windows 右下角查看运行状态，可以构建并启动轻量托盘 EXE：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\client\build-tray-exe.ps1
+.\CodexRemoteBridgeTray.exe
+```
+
+右键托盘图标可以：
+
+```text
+启动桥接
+停止桥接
+重启桥接
+安装/检查/配置
+前台启动窗口
+开启开机自启动
+关闭开机自启动
+打开日志
+打开配置
+打开项目目录
+刷新状态
+停止桥接并退出
+```
+
+托盘程序只做低频状态轮询和菜单控制，不包含重型 GUI 框架。它是独立入口，不会改变默认后台启动和 `start.ps1` 的自启动流程。托盘里的“开机自启动”会把 EXE 注册为登录自启动，适合想在右下角直接看到运行状态的场景。
+
+如果只想用 PowerShell 版托盘脚本，也可以运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\client\start-bridge-tray.ps1
+```
+
+脚本会提示输入 `QQ_APP_ID` 和 `QQ_APP_SECRET`，申请入口是：
+
+```text
+https://q.qq.com/#/
+```
+
+自动安装依赖前，脚本会检查环境变量、Windows 代理、git/npm 代理和 WinHTTP 代理。如果检测到代理，会询问是否用于下载安装；如果没有检测到，也可以手动输入代理地址。
+
+安装过程中会显示当前安装阶段和进度提示。`pip` 和 `npm` 会尽量显示自身下载进度，`winget` 安装会显示脚本侧进度，避免用户无法判断是否仍在执行。
+
+脚本输出以中文为主。常见安装路径：
+
+```text
+Python 3             -> winget
+websocket-client     -> pip install --user
+Node.js LTS          -> winget
+@openai/codex        -> npm install -g
+```
+
+### 手动安装
 
 安装 Python 依赖：
 
@@ -81,6 +156,8 @@ QQ_ALLOWED_USER_OPENIDS=openid1,openid2
 
 ### 启动
 
+如果使用一键脚本，建议直接在项目根目录运行 `start.ps1`。下面是底层手动启动方式。
+
 前台启动：
 
 ```powershell
@@ -114,13 +191,25 @@ client/data/qq-gateway-autostart.log
 /model                        显示当前模型和思考强度
 /model gpt-5.5 high           设置模型和思考强度
 /model gpt-5.4 xhigh          设置模型和思考强度
+/setup                        显示设置面板
+/output                       显示输出设置
+/output stage on/off          开关阶段性输出
+/output userContext on/off    开关最终输出是否带用户输入
 /timeout                      显示 Codex 单次调用超时
 /timeout 45                   设置单次调用超时为 45 分钟
+/heartbeat                    显示任务提醒频率
+/heartbeat 5                  设置任务提醒频率为 5 分钟
+/heartbeat off                关闭任务提醒
+/truncate on/off              开关长内容截断
+/recent-default               显示最近对话默认条数
+/recent-default 10            设置 /recent 默认展示 10 条
 /permission                   显示当前权限
 /permission read only         只读模式
-/permission ask               Ask for approval
-/permission approve           工作区可写，不人工审批
-/permission full              完全访问
+/permission ask               请求批准，普通任务先发待批准请求
+/permission auto              替我审批，使用 Codex 自动审批审查
+/permission full              完全权限，绕过沙箱和审批
+/permission approve           兼容旧命令，等同 /permission auto
+/approval-test                生成一条测试审批请求，不执行真实任务
 /pending                      显示待审批请求
 /allow [id]                   批准待审批请求
 /reject [id]                  拒绝待审批请求
@@ -163,32 +252,38 @@ QQ_SEND_IMAGE_MAX_COUNT=4
 QQ_SEND_IMAGE_MAX_BYTES=10485760
 ```
 
-长任务默认 30 分钟超时，可用 `/timeout 45` 在线调整。
+长任务默认 30 分钟超时，可用 `/timeout 45` 在线调整。常用时长也可以在 `/setup` 的“超时设置”里点击按钮选择。
 
 ### 任务队列和半全量输出
 
-普通 Codex 消息会进入本地任务队列并立即返回 `task_id`。同一个 Codex 会话按顺序执行，不同会话最多并发执行 `QQ_CODEX_MAX_PARALLEL` 个任务。运行中任务会定期发送状态心跳；如果 Codex JSONL 事件里出现阶段性 assistant 消息，桥接器会按间隔发送阶段性输出，最后仍发送完整最终结果。
+普通 Codex 消息会进入本地任务队列并立即返回 `task_id`，并提供“查看任务队列”和“取消当前任务”按钮。同一个 Codex 会话按顺序执行，不同会话最多并发执行 `QQ_CODEX_MAX_PARALLEL` 个任务。运行中任务默认每 5 分钟发送状态心跳，可用 `/heartbeat` 调整。阶段性输出默认关闭，可用 `/output stage on/off` 临时开关；最终输出默认会先显示任务 id 和用户输入，可用 `/output userContext on/off` 控制。长内容默认按分片上限截断，可用 `/truncate off` 改为尽量分段发送完整内容。
 
 ```env
 QQ_JOB_QUEUE_SIZE=20
 QQ_CODEX_MAX_PARALLEL=5
-QQ_TASK_STATUS_INTERVAL_SECONDS=60
+QQ_TASK_STATUS_INTERVAL_SECONDS=300
 QQ_TASK_PARTIAL_INTERVAL_SECONDS=60
 QQ_TASK_PARTIAL_MAX_CHARS=1200
+QQ_SEND_PARTIAL_OUTPUTS=0
+QQ_SHOW_TASK_CONTEXT_ON_FINAL=1
+QQ_TRUNCATE_LONG_REPLIES=1
 ```
 
 ### 权限映射
 
 ```text
-read only -> sandbox=read-only, approval=never
-ask       -> sandbox=workspace-write, approval=on-request
-approve   -> sandbox=workspace-write, approval=never
-full      -> --dangerously-bypass-approvals-and-sandbox
+read only -> sandbox=read-only, approval=never，不写入文件
+ask       -> 请求批准：先生成远程待批准请求；批准后用 workspace-write + on-request 执行
+auto      -> 替我审批：workspace-write + on-request + approvals_reviewer=auto_review
+full      -> --dangerously-bypass-approvals-and-sandbox，风险最高
+approve   -> 兼容旧命令，等同 auto
 ```
+
+说明：`ask` 目前包含本项目自己的任务级远程审批；`auto` 对齐 Codex UI 的“替我审批”语义，让 Codex 对检测到的风险操作使用自动审批审查。当前 QQ 侧不会完整接管 Codex 原生命令级审批弹窗。
 
 ### 安全
 
-不要提交 `client/.env`、QQ AppSecret、openid、日志、本地会话数据或审批状态文件。
+不要提交 `client/.env`、QQ AppSecret、openid、日志、本地会话数据、审批状态文件、本地 Codex 状态目录或临时资料目录。
 
 如果 QQ AppSecret 或 token 曾经在截图、日志或聊天中暴露，建议在 QQ Bot 后台重新生成，并更新本地 `client/.env`。
 
@@ -225,7 +320,82 @@ Local prompt-history mode is still available for compatibility:
 CODEX_CONTEXT_MODE=prompt
 ```
 
-### Setup
+### Windows One-Click Setup (Recommended)
+
+The root `start.ps1` script checks Python, `websocket-client`, Codex CLI, Node.js/npm, and local configuration in order. If a component is missing, it asks before installing it automatically.
+
+Run check-only mode first:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -CheckOnly
+```
+
+Start in foreground:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1
+```
+
+Start in background:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Background
+```
+
+Background mode starts the hidden background supervisor by default and does not show a Windows tray icon.
+
+If you want to see runtime status in the Windows notification area, build and start the lightweight tray EXE:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\client\build-tray-exe.ps1
+.\CodexRemoteBridgeTray.exe
+```
+
+Right-click the tray icon to:
+
+```text
+Start bridge
+Stop bridge
+Restart bridge
+Install/check/configure
+Foreground startup window
+Enable startup at login
+Disable startup at login
+Open log
+Open config
+Open project folder
+Refresh status
+Stop bridge and exit
+```
+
+The tray helper only performs low-frequency process checks and menu actions. It does not use a heavy GUI framework. It is an independent entry point and does not change the default background or `start.ps1` autostart flow. The startup-at-login menu registers the EXE itself at Windows logon, which is useful when you want the notification-area status indicator after reboot.
+
+The PowerShell tray script is also available as a fallback:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\client\start-bridge-tray.ps1
+```
+
+The script asks for `QQ_APP_ID` and `QQ_APP_SECRET`. Apply for them here:
+
+```text
+https://q.qq.com/#/
+```
+
+Before installing dependencies, the script checks environment variables, Windows proxy settings, git/npm proxy settings, and WinHTTP proxy settings. If a proxy is found, it asks whether to use it for downloads. If no proxy is detected, you can still enter one manually.
+
+During installation, the script displays the current step and progress status. `pip` and `npm` use their own download progress when possible; `winget` uses script-side progress messages so users can see that installation is still running.
+
+Common automatic install paths:
+
+```text
+Python 3             -> winget
+websocket-client     -> pip install --user
+Node.js LTS          -> winget
+@openai/codex        -> npm install -g
+```
+
+### Manual Setup
 
 Install Python dependencies:
 
@@ -269,6 +439,8 @@ Leave it empty only if all users who can message the bot are allowed.
 
 ### Start
 
+If you use the one-click script, run `start.ps1` from the project root. The commands below are the lower-level manual startup options.
+
 Foreground:
 
 ```powershell
@@ -302,13 +474,25 @@ Messages starting with `/` are handled locally by the bridge and are not sent to
 /model                        Show current model/reasoning
 /model gpt-5.5 high           Set model and reasoning
 /model gpt-5.4 xhigh          Set model and reasoning
+/setup                        Show settings panel
+/output                       Show output settings
+/output stage on/off          Toggle partial output
+/output userContext on/off    Toggle user prompt context in final output
 /timeout                      Show Codex task timeout
 /timeout 45                   Set Codex task timeout to 45 minutes
+/heartbeat                    Show task heartbeat frequency
+/heartbeat 5                  Set task heartbeat frequency to 5 minutes
+/heartbeat off                Disable task heartbeat messages
+/truncate on/off              Toggle long-reply truncation
+/recent-default               Show default recent-message count
+/recent-default 10            Set /recent default count to 10
 /permission                   Show current permission mode
 /permission read only         Read-only mode
-/permission ask               Ask for approval
-/permission approve           Workspace write without manual approval
-/permission full              Full access
+/permission ask               Request approval before normal tasks
+/permission auto              Let Codex auto-review risky approval requests
+/permission full              Full access; bypass sandbox and approvals
+/permission approve           Legacy alias for /permission auto
+/approval-test                Create a test pending approval without running a real task
 /pending                      Show pending approval requests
 /allow [id]                   Approve a pending request
 /reject [id]                  Reject a pending request
@@ -351,31 +535,37 @@ QQ_SEND_IMAGE_MAX_COUNT=4
 QQ_SEND_IMAGE_MAX_BYTES=10485760
 ```
 
-Long Codex tasks default to a 30-minute timeout. Use `/timeout 45` to adjust it at runtime.
+Long Codex tasks default to a 30-minute timeout. Use `/timeout 45` to adjust it at runtime. Common values are also available from `/setup` -> timeout settings.
 
 ### Task Queue and Semi-Streaming
 
-Normal Codex messages are enqueued and immediately return a `task_id`. Tasks for the same Codex session run sequentially, while different sessions may run concurrently up to `QQ_CODEX_MAX_PARALLEL`. Running tasks periodically send heartbeat status messages. If Codex JSONL emits intermediate assistant messages, the bridge sends partial updates at a controlled interval and still sends the final full result.
+Normal Codex messages are enqueued and immediately return a `task_id` with task-list and cancel buttons. Tasks for the same Codex session run sequentially, while different sessions may run concurrently up to `QQ_CODEX_MAX_PARALLEL`. Running tasks send heartbeat status messages every 5 minutes by default and can be adjusted with `/heartbeat`. Partial output is off by default and can be toggled with `/output stage on/off`. Final output includes the task id and user prompt by default and can be toggled with `/output userContext on/off`. Long replies are truncated at the reply chunk limit by default; use `/truncate off` to send as many chunks as possible.
 
 ```env
 QQ_JOB_QUEUE_SIZE=20
 QQ_CODEX_MAX_PARALLEL=5
-QQ_TASK_STATUS_INTERVAL_SECONDS=60
+QQ_TASK_STATUS_INTERVAL_SECONDS=300
 QQ_TASK_PARTIAL_INTERVAL_SECONDS=60
 QQ_TASK_PARTIAL_MAX_CHARS=1200
+QQ_SEND_PARTIAL_OUTPUTS=0
+QQ_SHOW_TASK_CONTEXT_ON_FINAL=1
+QQ_TRUNCATE_LONG_REPLIES=1
 ```
 
 ### Permission Mapping
 
 ```text
-read only -> sandbox=read-only, approval=never
-ask       -> sandbox=workspace-write, approval=on-request
-approve   -> sandbox=workspace-write, approval=never
-full      -> --dangerously-bypass-approvals-and-sandbox
+read only -> sandbox=read-only, approval=never; no file writes
+ask       -> request approval: create a remote pending approval first; approved tasks run with workspace-write + on-request
+auto      -> auto-review approvals: workspace-write + on-request + approvals_reviewer=auto_review
+full      -> --dangerously-bypass-approvals-and-sandbox; highest risk
+approve   -> legacy alias for auto
 ```
+
+Note: `ask` includes this project's task-level remote approval layer. `auto` matches the Codex UI "auto review approvals" intent by enabling Codex automatic approval review for detected risky operations. The QQ side does not currently take over every native Codex command-level approval prompt.
 
 ### Security
 
-Do not commit `client/.env`, QQ AppSecret, openids, logs, local session data, or approval state files.
+Do not commit `client/.env`, QQ AppSecret, openids, logs, local session data, approval state files, local Codex state directories, or temporary research/data folders.
 
 If a QQ AppSecret or token was exposed in screenshots, logs, or chat messages, rotate it in the QQ Bot console and update `client/.env`.

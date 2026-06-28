@@ -1,5 +1,9 @@
 client/.env
 client/data/
+CodexRemoteBridgeTray.exe
+client/CodexRemoteBridgeTray.exe
+.codex/
+tmp_papers/
 trash/
 **/__pycache__/
 *.py[cod]

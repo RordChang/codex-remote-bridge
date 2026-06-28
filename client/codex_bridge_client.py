@@ -69,6 +69,13 @@ def load_dotenv(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on", "开", "是"}
+
+
 load_dotenv(BASE_DIR / ".env")
 
 CODEX_COMMAND = os.getenv("CODEX_COMMAND", "codex")
@@ -80,6 +87,9 @@ CODEX_CONTEXT_MODE = os.getenv("CODEX_CONTEXT_MODE", "native").strip().lower() o
 QQ_OWNER_QQ = os.getenv("QQ_OWNER_QQ", "").strip()
 MAX_HISTORY_CHARS = int(os.getenv("MAX_HISTORY_CHARS", "12000"))
 CODEX_TIMEOUT_SECONDS = max(30, int(os.getenv("CODEX_TIMEOUT_SECONDS", "1800")))
+RECENT_DEFAULT_COUNT = max(1, min(20, int(os.getenv("RECENT_DEFAULT_COUNT", "5"))))
+TASK_STATUS_INTERVAL_SECONDS = max(0, int(os.getenv("QQ_TASK_STATUS_INTERVAL_SECONDS", "300")))
+TRUNCATE_LONG_REPLIES = env_bool("QQ_TRUNCATE_LONG_REPLIES", True)
 
 ALLOWED_MODELS = [
     item.strip()
@@ -93,32 +103,39 @@ current_codex_job = ""
 current_codex_tasks: Dict[str, subprocess.Popen] = {}
 approved_run = threading.local()
 
+
+def clamp_int(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, value))
+
 PERMISSION_PROFILES = {
     "read-only": {
-        "label": "read only",
+        "label": "只读",
         "sandbox": "read-only",
         "approval_policy": "never",
         "dangerous_bypass": False,
-        "description": "只读沙箱，不自动越权",
+        "description": "只读沙箱，不写入文件，也不会生成远程审批请求",
     },
     "ask": {
-        "label": "Ask for approval",
+        "label": "请求批准",
         "sandbox": "workspace-write",
         "approval_policy": "on-request",
+        "approvals_reviewer": "user",
         "dangerous_bypass": False,
-        "description": "可写工作区，遇到需要升级的操作不自动批准",
+        "description": "普通任务先发到 QQ 等你批准；Codex 原生审批由用户确认",
     },
-    "approve": {
-        "label": "approve for me",
+    "auto": {
+        "label": "替我审批",
         "sandbox": "workspace-write",
-        "approval_policy": "never",
+        "approval_policy": "on-request",
+        "approvals_reviewer": "auto_review",
         "dangerous_bypass": False,
-        "description": "可写工作区，不走人工审批",
+        "description": "不生成 QQ 待批准请求；Codex 对检测到的风险操作使用自动审批审查",
     },
     "full": {
-        "label": "full access",
+        "label": "完全权限",
         "sandbox": "danger-full-access",
         "approval_policy": "never",
+        "approvals_reviewer": "user",
         "dangerous_bypass": True,
         "description": "完全绕过沙箱和审批，风险最高",
     },
@@ -201,8 +218,8 @@ def normalize_permission(value: str) -> str:
         return "read-only"
     if compact in {"ask", "askforapproval", "approval", "onrequest"}:
         return "ask"
-    if compact in {"approve", "approveforme", "auto", "autowrite", "workspace", "write"}:
-        return "approve"
+    if compact in {"approve", "approveforme", "auto", "autowrite", "workspace", "write", "noapproval", "noapprovals", "noask", "direct"}:
+        return "auto"
     if compact in {"full", "fullaccess", "danger", "dangerfullaccess"}:
         return "full"
     if value in PERMISSION_PROFILES:
@@ -276,12 +293,22 @@ def load_state() -> Dict[str, Any]:
         "reasoning_effort": normalize_reasoning(CODEX_REASONING_EFFORT),
         "permission": normalize_permission(CODEX_PERMISSION),
         "timeout_seconds": CODEX_TIMEOUT_SECONDS,
+        "recent_default_count": RECENT_DEFAULT_COUNT,
+        "task_status_interval_seconds": TASK_STATUS_INTERVAL_SECONDS,
+        "truncate_long_replies": TRUNCATE_LONG_REPLIES,
         "contacts": {},
     }
     for key, value in defaults.items():
         if key not in state:
             state[key] = value
             changed = True
+    try:
+        normalized_permission = normalize_permission(str(state.get("permission", defaults["permission"])))
+    except ValueError:
+        normalized_permission = defaults["permission"]
+    if state.get("permission") != normalized_permission:
+        state["permission"] = normalized_permission
+        changed = True
     if int(state.get("timeout_seconds", 0) or 0) == 900 and CODEX_TIMEOUT_SECONDS > 900:
         state["timeout_seconds"] = CODEX_TIMEOUT_SECONDS
         changed = True
@@ -390,6 +417,10 @@ def is_approved_execution() -> bool:
 def current_process_runtime() -> Dict[str, Any]:
     runtime = current_runtime()
     force_permission = str(getattr(approved_run, "force_permission", "") or "")
+    try:
+        force_permission = normalize_permission(force_permission) if force_permission else ""
+    except ValueError:
+        force_permission = ""
     if force_permission in PERMISSION_PROFILES:
         runtime = dict(runtime)
         runtime["permission"] = force_permission
@@ -411,7 +442,13 @@ def is_bridge_command_text(text: str) -> bool:
         "/status",
         "/whoami",
         "/model",
+        "/setup",
+        "/output",
         "/timeout",
+        "/heartbeat",
+        "/truncate",
+        "/recent-default",
+        "/approval-test",
         "/permission",
         "/resume",
         "/recent",
@@ -452,7 +489,7 @@ def can_run_without_approval(text: str) -> bool:
     ]
     if any(term in lower for term in safe_terms):
         return True
-    return True
+    return False
 
 
 def build_approval_plan(user_text: str, job: Dict[str, Any]) -> str:
@@ -675,7 +712,7 @@ def run_approved_pending_approval(item: Dict[str, Any]) -> str:
     old_enabled = getattr(approved_run, "enabled", False)
     old_force_permission = getattr(approved_run, "force_permission", "")
     approved_run.enabled = True
-    approved_run.force_permission = "approve"
+    approved_run.force_permission = "auto"
     try:
         append_history("User", f"[approved #{item_id}]\n{user_text}")
         answer = run_codex(job)
@@ -699,6 +736,9 @@ def current_runtime() -> Dict[str, Any]:
         "active_session_id": str(state.get("active_session_id", "")),
         "active_native_session_id": str(state.get("active_native_session_id", "")),
         "timeout_seconds": int(state.get("timeout_seconds", CODEX_TIMEOUT_SECONDS) or CODEX_TIMEOUT_SECONDS),
+        "recent_default_count": clamp_int(int(state.get("recent_default_count", RECENT_DEFAULT_COUNT) or RECENT_DEFAULT_COUNT), 1, 20),
+        "task_status_interval_seconds": clamp_int(int(state.get("task_status_interval_seconds", TASK_STATUS_INTERVAL_SECONDS) or 0), 0, 86400),
+        "truncate_long_replies": bool(state.get("truncate_long_replies", TRUNCATE_LONG_REPLIES)),
     }
 
 
@@ -913,6 +953,13 @@ def _extract_native_user_text(line: str) -> str:
     return ""
 
 
+def _event_timestamp_text(event: Dict[str, Any]) -> str:
+    raw = str(event.get("timestamp") or event.get("created_at") or event.get("time") or "").strip()
+    if not raw:
+        return ""
+    return raw.replace("T", " ").replace("Z", "").split(".")[0]
+
+
 def _extract_native_conversation_message(line: str) -> Optional[Dict[str, str]]:
     if "message" not in line and "agent_message" not in line and '"role"' not in line:
         return None
@@ -932,7 +979,7 @@ def _extract_native_conversation_message(line: str) -> Optional[Dict[str, str]]:
                 return None
             text = _extract_input_text(payload.get("content"))
             if text:
-                return {"role": role, "text": text}
+                return {"role": role, "text": text, "time": _event_timestamp_text(event)}
         return None
 
     if event_type in {"item.completed", "item.started"}:
@@ -943,7 +990,7 @@ def _extract_native_conversation_message(line: str) -> Optional[Dict[str, str]]:
         if item_type == "agent_message":
             text = str(item.get("text") or "").strip()
             if text:
-                return {"role": "assistant", "text": text}
+                return {"role": "assistant", "text": text, "time": _event_timestamp_text(event)}
         return None
 
     if event_type == "event_msg":
@@ -953,7 +1000,7 @@ def _extract_native_conversation_message(line: str) -> Optional[Dict[str, str]]:
         if payload.get("type") == "user_message":
             message = payload.get("message")
             if isinstance(message, str) and message.strip():
-                return {"role": "user", "text": message.strip()}
+                return {"role": "user", "text": message.strip(), "time": _event_timestamp_text(event)}
         return None
 
     return None
@@ -1359,7 +1406,7 @@ def find_native_session(session_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def native_session_messages(session_id: str, limit: int = 20) -> List[Dict[str, str]]:
+def native_session_messages(session_id: str, limit: int = 0) -> List[Dict[str, str]]:
     item = find_native_session(session_id)
     if not item:
         return []
@@ -1384,9 +1431,11 @@ def current_native_session_id() -> str:
     return str(state.get("active_native_session_id", "")).strip()
 
 
-def truncate_message_text(text: str, limit: int = 360) -> str:
+def truncate_message_text(text: str, limit: int = 0) -> str:
     text = (text or "").replace("\r\n", "\n").strip()
     text = re.sub(r"\n{3,}", "\n\n", text)
+    if limit <= 0:
+        return text
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 12)].rstrip() + " ...[截断]"
@@ -1395,26 +1444,45 @@ def truncate_message_text(text: str, limit: int = 360) -> str:
 def format_native_messages(messages: List[Dict[str, str]], title: str = "") -> str:
     if not messages:
         return "没有找到可展示的最近对话内容。"
-    lines = [title] if title else []
+    blocks = [title] if title else []
     for index, message in enumerate(messages, 1):
         role = "我" if message.get("role") == "user" else "Codex"
+        message_time = str(message.get("time") or "").strip()
         text = truncate_message_text(message.get("text", ""))
-        lines.append(f"--- {index}. {role} ---")
-        lines.append(text)
-    return "\n".join(lines)
+        time_suffix = f" | {message_time}" if message_time else ""
+        blocks.append(f"--- {index}. {role}{time_suffix} ---\n{text}")
+    return "\n\n".join(blocks)
+
+
+def clamp_recent_count(value: int) -> int:
+    return clamp_int(value, 1, 20)
 
 
 def parse_recent_args(args: str) -> Dict[str, Any]:
     raw = (args or "").strip()
-    result: Dict[str, Any] = {"count": 4, "session_id": ""}
+    default_count = int(current_runtime().get("recent_default_count", RECENT_DEFAULT_COUNT) or RECENT_DEFAULT_COUNT)
+    result: Dict[str, Any] = {"count": clamp_recent_count(default_count), "start": 1, "session_id": ""}
+    number_index = 0
     for token in raw.split():
         if re.fullmatch(r"\d+", token):
-            result["count"] = max(1, min(10, int(token)))
+            number_index += 1
+            if number_index == 1:
+                result["count"] = clamp_recent_count(int(token))
+            elif number_index == 2:
+                result["start"] = max(1, int(token))
         elif token.lower() in {"last", "latest"} or token in {"最近"}:
             continue
         else:
             result["session_id"] = token
     return result
+
+
+def recent_window(messages: List[Dict[str, str]], count: int, start: int) -> List[Dict[str, str]]:
+    count = clamp_recent_count(count)
+    start = max(1, start)
+    newest_first = list(reversed(messages))
+    selected = newest_first[start - 1:start - 1 + count]
+    return list(reversed(selected))
 
 
 def recent_command(args: str = "") -> str:
@@ -1426,24 +1494,40 @@ def recent_command(args: str = "") -> str:
         session_id = current_native_session_id()
     if not session_id:
         return "当前没有 active Codex 原生会话。先发送 /resume 选择会话，或发送 /new 创建新会话。"
-    count = int(parsed.get("count") or 4)
-    messages = native_session_messages(session_id, limit=count)
-    return format_native_messages(messages, f"最近 {count} 条对话 | {session_id[-8:]}")
+    default_count = int(current_runtime().get("recent_default_count", RECENT_DEFAULT_COUNT) or RECENT_DEFAULT_COUNT)
+    count = clamp_recent_count(int(parsed.get("count") or default_count))
+    start = max(1, int(parsed.get("start") or 1))
+    messages = native_session_messages(session_id)
+    selected = recent_window(messages, count, start)
+    end = start + len(selected) - 1 if selected else start + count - 1
+    return format_native_messages(selected, f"最近第 {start}-{end} 条对话 | {session_id[-8:]}")
 
 
 def last_command(args: str = "") -> str:
-    mode = (args or "").strip().lower()
+    tokens = (args or "").strip().split()
+    mode = tokens[0].lower() if tokens else ""
+    rest = " ".join(tokens[1:]) if tokens else ""
+    parsed = parse_recent_args(rest)
+    default_count = int(current_runtime().get("recent_default_count", RECENT_DEFAULT_COUNT) or RECENT_DEFAULT_COUNT)
+    count = clamp_recent_count(int(parsed.get("count") or default_count))
+    start = max(1, int(parsed.get("start") or 1))
     session_id = current_native_session_id()
     if not session_id:
         return "当前没有 active Codex 原生会话。先发送 /resume 选择会话。"
-    messages = native_session_messages(session_id, limit=80)
+    messages = native_session_messages(session_id)
     if mode in {"user", "me", "mine", "u", "我"}:
         messages = [item for item in messages if item.get("role") == "user"]
-        return format_native_messages(messages[-1:], "我发出的上一句")
+        selected = recent_window(messages, count, start)
+        end = start + len(selected) - 1 if selected else start + count - 1
+        return format_native_messages(selected, f"我发出的最近第 {start}-{end} 条")
     if mode in {"codex", "assistant", "answer", "a", "回复"}:
         messages = [item for item in messages if item.get("role") == "assistant"]
-        return format_native_messages(messages[-1:], "Codex 的上一句回复")
-    return format_native_messages(messages[-2:], "最近一轮对话")
+        selected = recent_window(messages, count, start)
+        end = start + len(selected) - 1 if selected else start + count - 1
+        return format_native_messages(selected, f"Codex 最近第 {start}-{end} 条回复")
+    selected = recent_window(messages, count, start)
+    end = start + len(selected) - 1 if selected else start + count - 1
+    return format_native_messages(selected, f"最近第 {start}-{end} 条对话")
 
 
 def extract_thread_id(stdout: str) -> str:
@@ -1477,6 +1561,8 @@ def codex_base_cmd(runtime: Dict[str, Any], output_file: Path) -> List[str]:
     cmd[2:2] = [
         "-c",
         f"approval_policy=\"{profile['approval_policy']}\"",
+        "-c",
+        f"approvals_reviewer=\"{profile.get('approvals_reviewer', 'user')}\"",
         "-c",
         f"model_reasoning_effort=\"{runtime['reasoning_effort']}\"",
     ]
@@ -1769,7 +1855,8 @@ def status_text() -> str:
         f"Model: {runtime['model']}",
         f"Reasoning: {runtime['reasoning_effort']}",
         f"Timeout: {runtime['timeout_seconds']}s",
-        f"Permission: {profile['label']} | sandbox={profile['sandbox']} | approval={profile['approval_policy']}",
+        f"Recent default: {runtime['recent_default_count']}",
+        f"Permission: {profile['label']} | sandbox={profile['sandbox']} | approval={profile['approval_policy']} | reviewer={profile.get('approvals_reviewer', 'user')}",
         f"Pending approvals: {pending_count}",
     ]
     if QQ_OWNER_QQ:
@@ -1800,14 +1887,24 @@ def help_text() -> str:
         "/cancel - 取消当前正在运行的 Codex 任务",
         "/cancel <task_id> - 取消指定 Codex 任务",
         "/tasks - 查看运行中和排队中的 Codex 任务",
+        "/setup - 查看设置面板",
+        "/output - 查看阶段性输出和最终输出设置",
+        "/output stage on|off - 开关阶段性输出",
+        "/output userContext on|off - 开关最终输出是否带用户输入",
         "/timeout - 查看 Codex 单次调用超时",
         "/timeout 45 - 设置单次调用超时为 45 分钟",
+        "/heartbeat - 查看任务提醒频率设置",
+        "/truncate on|off - 开关长内容截断",
+        "/recent-default - 查看最近对话默认条数",
+        "/recent-default 10 - 设置 /recent 默认展示 10 条",
         "/restart - 重启 QQ Gateway 客户端",
         "/permission - 查看当前权限",
         "/permission read only - 只读",
-        "/permission ask - Ask for approval",
-        "/permission approve - approve for me",
-        "/permission full - full access",
+        "/permission ask - 请求批准，普通任务先发待批准请求",
+        "/permission auto - 替我审批，Codex 自动审查风险操作",
+        "/permission full - 完全权限，绕过沙箱和审批",
+        "/permission approve - 兼容旧命令，等同 /permission auto",
+        "/approval-test - 生成一条测试审批请求，不执行真实任务",
         "/pending - 查看待批准操作",
         "/allow [id] - 批准待执行操作；只有一个待批准项时可省略 id",
         "/reject [id] - 拒绝并删除待执行操作",
@@ -1816,11 +1913,11 @@ def help_text() -> str:
         "/resume page 2 - 展示目录第 2 页",
         "/resume dir <目录> - 展示指定目录下的会话",
         "/resume <id> - 切换到指定 Codex 原生会话",
-        "/recent - 查看当前会话最近 4 条对话",
-        "/recent N - 查看当前会话最近 N 条对话（N=1-10）",
-        "/recent N <id> - 查看指定会话最近 N 条对话（N=1-10）",
-        "/last user - 查看我发出的上一句",
-        "/last codex - 查看 Codex 的上一句回复",
+        "/recent - 查看当前会话最近 5 条对话",
+        "/recent N S - 从最近第 S 条开始查看 N 条对话（N=1-20，S 可省略）",
+        "/recent N S <id> - 查看指定会话对应范围的对话",
+        "/last user [N S] - 查看我发出的最近 N 句，可分页",
+        "/last codex [N S] - 查看 Codex 的最近 N 句回复，可分页",
         "/new [标题] - 开启一段新的 Codex 原生会话",
         "/delete - 展示 Codex 原生会话列表",
         "/delete <id> - 归档指定 Codex 原生会话",
@@ -1840,6 +1937,7 @@ def start_text() -> str:
         "/model - 模型设置",
         "/whoami - 用户信息",
         "/status - 状态",
+        "/setup - 设置",
         "/help - 帮助",
     ])
 
@@ -1908,15 +2006,32 @@ def timeout_command(args: str) -> str:
     if not args.strip():
         return (
             f"当前 Codex 单次调用超时：{current} 秒（约 {int((current + 59) / 60)} 分钟）\n"
-            "用法：/timeout 45  设置为 45 分钟；范围 1-180 分钟。"
+            "用法：/timeout 45  设置为 45 分钟；范围 1-1440 分钟。"
         )
     match = re.search(r"\d+", args)
     if not match:
         return "无法识别超时时长。示例：/timeout 45"
-    minutes = max(1, min(180, int(match.group(0))))
+    minutes = max(1, min(1440, int(match.group(0))))
     state["timeout_seconds"] = minutes * 60
     save_state(state)
     return f"已设置 Codex 单次调用超时：{minutes} 分钟。"
+
+
+def recent_default_command(args: str) -> str:
+    state = load_state()
+    current = clamp_recent_count(int(state.get("recent_default_count", RECENT_DEFAULT_COUNT) or RECENT_DEFAULT_COUNT))
+    if not args.strip():
+        return "\n".join([
+            f"当前最近对话默认条数：{current}",
+            "用法：/recent-default 10  设置 /recent 和 /last 的默认展示条数；范围 1-20。",
+        ])
+    match = re.search(r"\d+", args)
+    if not match:
+        return "无法识别条数。示例：/recent-default 10"
+    count = clamp_recent_count(int(match.group(0)))
+    state["recent_default_count"] = count
+    save_state(state)
+    return f"已设置最近对话默认条数：{count} 条。"
 
 
 def parse_permission_command(args: str) -> str:
@@ -1926,13 +2041,15 @@ def parse_permission_command(args: str) -> str:
         profile = PERMISSION_PROFILES[current]
         return "\n".join([
             f"当前权限：{profile['label']}",
-            f"sandbox={profile['sandbox']} approval={profile['approval_policy']}",
-            "可选：read only / ask / approve / full",
+            f"sandbox={profile['sandbox']} approval={profile['approval_policy']} reviewer={profile.get('approvals_reviewer', 'user')}",
+            profile["description"],
+            "可选：read only / ask / auto / full",
+            "说明：ask 对应请求批准；auto 对应替我审批；full 对应完全访问权限。approve 是旧命令别名，等同 auto。",
         ])
     try:
         permission = normalize_permission(args)
     except ValueError:
-        return "无法识别权限。可选：read only / ask / approve / full"
+        return "无法识别权限。可选：read only / ask / auto / full"
     state["permission"] = permission
     save_state(state)
     profile = PERMISSION_PROFILES[permission]
@@ -2092,8 +2209,20 @@ def handle_bridge_command(text: str, job: Optional[Dict[str, Any]] = None) -> Op
         return whoami_text(job)
     if command == "/model":
         return parse_model_command(args)
+    if command == "/setup":
+        return "设置面板仅在 QQ Bot 按钮模式下显示。可用 /output、/permission、/timeout 等命令直接调整。"
+    if command == "/output":
+        return "输出展示设置由 QQ Gateway 运行态管理，请在 QQ 中发送 /setup 或 /output。"
+    if command == "/heartbeat":
+        return "任务提醒频率由 QQ Gateway 运行态管理，请在 QQ 中发送 /setup 或 /heartbeat。"
+    if command == "/truncate":
+        return "长内容截断由 QQ Gateway 运行态管理，请在 QQ 中发送 /setup 或 /truncate on|off。"
+    if command == "/approval-test":
+        return "审批测试需要 QQ 回复目标，请在 QQ 中发送 /approval-test。"
     if command == "/timeout":
         return timeout_command(args)
+    if command == "/recent-default":
+        return recent_default_command(args)
     if command == "/permission":
         return parse_permission_command(args)
     if command == "/pending":
@@ -2135,7 +2264,7 @@ def run_codex_prompt_mode(job: Dict[str, Any], on_event: Optional[Callable[[Dict
 要求：
 - 用中文回答。
 - 直接回答用户问题，不要提到桥接内部实现。
-- 当前权限模式：{profile['label']}；sandbox={profile['sandbox']}；approval={profile['approval_policy']}。
+- 当前权限模式：{profile['label']}；sandbox={profile['sandbox']}；approval={profile['approval_policy']}；reviewer={profile.get('approvals_reviewer', 'user')}。
 - 不要读取或泄露本机敏感信息，除非用户明确要求且当前权限模式允许。
 - 如果需要把本地图片发回 QQ，请单独输出一行：SEND_IMAGE: <本地图片绝对路径>。
 - 必要上下文在下面的当前会话历史片段里。
