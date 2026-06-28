@@ -1648,6 +1648,7 @@ def final_task_answer_text(task_id: str, job: Dict[str, Any], answer: str) -> st
     return "\n\n".join([
         f"任务 {task_id} 的最终输出",
         f"用户输入：{task_prompt_preview(str(job.get('text', '')))}",
+        "Codex输出：",
         answer,
     ])
 

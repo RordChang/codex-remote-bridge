@@ -37,38 +37,19 @@ CODEX_CONTEXT_MODE=native
 CODEX_CONTEXT_MODE=prompt
 ```
 
-### Windows 一键部署（推荐）
+### Windows 快速开始（推荐）
 
-项目根目录的 `start.ps1` 会按顺序检查 Python、`websocket-client`、Codex CLI、Node.js/npm 和本地配置。缺少组件时，脚本会先询问用户，确认后再自动安装。
+普通用户建议直接下载发布包，不需要先 clone 仓库，也不需要自己编译。
 
-首次建议先运行仅检查模式：
+1. 打开本仓库的 [Releases](https://github.com/G-Photon/codex-remote-bridge/releases) 页面。
+2. 下载最新的 Windows 发布包，例如 `codex-remote-bridge-*.zip`。
+3. 解压到一个固定目录，例如 `D:\Tools\CodexRemoteBridge`。
+4. 双击运行解压目录里的 `CodexRemoteBridgeTray.exe`。
+5. 按托盘菜单提示完成安装、检查和配置。
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\start.ps1 -CheckOnly
-```
+首次运行时，托盘程序会自动调用项目里的 `start.ps1` 完成环境检查和配置。缺少 Python、`websocket-client`、Codex CLI、Node.js/npm 等组件时，脚本会先询问用户，确认后再自动安装。
 
-确认配置无误后前台启动：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\start.ps1
-```
-
-后台启动：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\start.ps1 -Background
-```
-
-后台模式默认启动隐藏的后台守护进程，不显示 Windows 托盘图标。
-
-如果需要在 Windows 右下角查看运行状态，可以构建并启动轻量托盘 EXE：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\client\build-tray-exe.ps1
-.\CodexRemoteBridgeTray.exe
-```
-
-右键托盘图标可以：
+右键 Windows 右下角托盘图标可以：
 
 ```text
 启动桥接
@@ -85,18 +66,60 @@ powershell -ExecutionPolicy Bypass -File .\client\build-tray-exe.ps1
 停止桥接并退出
 ```
 
-托盘程序只做低频状态轮询和菜单控制，不包含重型 GUI 框架。它是独立入口，不会改变默认后台启动和 `start.ps1` 的自启动流程。托盘里的“开机自启动”会把 EXE 注册为登录自启动，适合想在右下角直接看到运行状态的场景。
-
-如果只想用 PowerShell 版托盘脚本，也可以运行：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\client\start-bridge-tray.ps1
-```
-
-脚本会提示输入 `QQ_APP_ID` 和 `QQ_APP_SECRET`，申请入口是：
+配置时需要填写 QQ Bot 的 `QQ_APP_ID` 和 `QQ_APP_SECRET`，申请入口：
 
 ```text
 https://q.qq.com/#/
+```
+
+如果要限制谁能使用机器人，启动后先给机器人发送：
+
+```text
+/whoami
+```
+
+然后把返回的 `user_openid` 写入配置里的 `QQ_ALLOWED_USER_OPENIDS`。
+
+### 源码构建（开发者）
+
+如果你想从源码构建托盘 EXE，可以 clone 仓库后运行：
+
+```powershell
+git clone https://github.com/G-Photon/codex-remote-bridge.git
+cd codex-remote-bridge
+powershell -ExecutionPolicy Bypass -File .\client\build-tray-exe.ps1
+```
+
+构建完成后会在项目根目录生成：
+
+```text
+CodexRemoteBridgeTray.exe
+```
+
+然后双击运行这个 EXE 即可。构建脚本使用 Windows 自带的 PowerShell/.NET 编译能力，不需要额外安装 Visual Studio。
+
+开发或排障时，也可以直接运行底层启动脚本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1
+```
+
+仅检查环境和配置：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -CheckOnly
+```
+
+后台启动但不显示托盘：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Background
+```
+
+如果不想编译 EXE，也可以使用 PowerShell 版托盘脚本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\client\start-bridge-tray.ps1
 ```
 
 自动安装依赖前，脚本会检查环境变量、Windows 代理、git/npm 代理和 WinHTTP 代理。如果检测到代理，会询问是否用于下载安装；如果没有检测到，也可以手动输入代理地址。
@@ -112,7 +135,7 @@ Node.js LTS          -> winget
 @openai/codex        -> npm install -g
 ```
 
-### 手动安装
+### 手动安装（高级）
 
 安装 Python 依赖：
 
@@ -156,20 +179,18 @@ QQ_ALLOWED_USER_OPENIDS=openid1,openid2
 
 ### 启动
 
-如果使用一键脚本，建议直接在项目根目录运行 `start.ps1`。下面是底层手动启动方式。
+发布包用户直接运行 `CodexRemoteBridgeTray.exe`。下面是开发和排障时可用的底层启动方式。
+
+托盘 EXE：
+
+```powershell
+.\CodexRemoteBridgeTray.exe
+```
 
 前台启动：
 
 ```powershell
-cd client
-.\start-bridge.ps1
-```
-
-后台 supervisor 启动：
-
-```powershell
-cd client
-python .\qq_gateway_background.py
+powershell -ExecutionPolicy Bypass -File .\start.ps1
 ```
 
 日志位置：
@@ -185,9 +206,10 @@ client/data/qq-gateway-autostart.log
 以 `/` 开头的消息由桥接器本地处理，不会发送给 AI。
 
 ```text
+/start                       显示入口面板、当前模型和快捷按钮
 /help                         显示所有指令
 /status                       显示 Gateway、上下文、模型、思考强度、权限
-/whoami                       显示当前 QQ Gateway openid
+/whoami                       显示当前 QQ Gateway openid，用于配置 allowlist
 /model                        显示当前模型和思考强度
 /model gpt-5.5 high           设置模型和思考强度
 /model gpt-5.4 xhigh          设置模型和思考强度
@@ -213,20 +235,26 @@ client/data/qq-gateway-autostart.log
 /pending                      显示待审批请求
 /allow [id]                   批准待审批请求
 /reject [id]                  拒绝待审批请求
-/revise [id] <instruction>    修改待审批请求
+/revise <id> <修改意见>       修改要求并重新生成审批计划
 /cancel                       取消当前 Codex 任务或待审批请求
 /cancel <task_id>             取消指定 Codex 任务
 /tasks                        查看运行中和排队中的 Codex 任务
 /restart                      重启 QQ Gateway 客户端
-/resume                       列出 Codex 原生会话
-/resume page 2                列出第 2 页
-/resume <id>                  切换到指定 Codex 会话
+/resume                       按目录展示 Codex 原生会话
+/resume page 2                展示目录第 2 页
+/resume dir <目录>            展示指定目录下的会话
+/resume <id>                  切换到指定 Codex 原生会话
+/recent                       查看当前会话最近 5 条对话
+/recent N S                   从最近第 S 条开始查看 N 条对话（N=1-20，S 可省略）
+/recent N S <id>              查看指定会话对应范围的对话
+/last user [N S]              查看我发出的最近 N 句，可分页
+/last codex [N S]             查看 Codex 的最近 N 句回复，可分页
 /new [title]                  新建 Codex 会话
 /delete                       列出可删除会话
 /delete <id>                  归档/删除指定会话
 ```
 
-如果 QQ Markdown/Keyboard 权限可用，`/resume` 和 `/model` 可以返回按钮卡片。需要在 `client/.env` 中启用 interaction 事件：
+如果 QQ Markdown/Keyboard 权限可用，`/start`、`/setup`、`/resume`、`/model`、`/tasks`、`/permission` 等指令可以返回按钮卡片。需要在 `client/.env` 中启用 interaction 事件：
 
 ```env
 QQ_GATEWAY_INTENTS=100663296
@@ -320,38 +348,19 @@ Local prompt-history mode is still available for compatibility:
 CODEX_CONTEXT_MODE=prompt
 ```
 
-### Windows One-Click Setup (Recommended)
+### Windows Quick Start (Recommended)
 
-The root `start.ps1` script checks Python, `websocket-client`, Codex CLI, Node.js/npm, and local configuration in order. If a component is missing, it asks before installing it automatically.
+Most users should use the release package instead of cloning and building the repository.
 
-Run check-only mode first:
+1. Open the repository [Releases](https://github.com/G-Photon/codex-remote-bridge/releases) page.
+2. Download the latest Windows package, for example `codex-remote-bridge-*.zip`.
+3. Extract it to a stable directory, for example `D:\Tools\CodexRemoteBridge`.
+4. Double-click `CodexRemoteBridgeTray.exe` in the extracted directory.
+5. Follow the tray menu prompts to install, check, and configure the bridge.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\start.ps1 -CheckOnly
-```
+On first run, the tray helper calls the bundled `start.ps1` script for environment checks and configuration. If Python, `websocket-client`, Codex CLI, Node.js/npm, or other required components are missing, the script asks before installing them automatically.
 
-Start in foreground:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\start.ps1
-```
-
-Start in background:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\start.ps1 -Background
-```
-
-Background mode starts the hidden background supervisor by default and does not show a Windows tray icon.
-
-If you want to see runtime status in the Windows notification area, build and start the lightweight tray EXE:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\client\build-tray-exe.ps1
-.\CodexRemoteBridgeTray.exe
-```
-
-Right-click the tray icon to:
+Right-click the Windows tray icon to:
 
 ```text
 Start bridge
@@ -368,18 +377,60 @@ Refresh status
 Stop bridge and exit
 ```
 
-The tray helper only performs low-frequency process checks and menu actions. It does not use a heavy GUI framework. It is an independent entry point and does not change the default background or `start.ps1` autostart flow. The startup-at-login menu registers the EXE itself at Windows logon, which is useful when you want the notification-area status indicator after reboot.
-
-The PowerShell tray script is also available as a fallback:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\client\start-bridge-tray.ps1
-```
-
-The script asks for `QQ_APP_ID` and `QQ_APP_SECRET`. Apply for them here:
+Configuration requires your QQ Bot `QQ_APP_ID` and `QQ_APP_SECRET`. Apply for them here:
 
 ```text
 https://q.qq.com/#/
+```
+
+To restrict who can use the bot, start it and send this message to the bot:
+
+```text
+/whoami
+```
+
+Then put the returned `user_openid` into `QQ_ALLOWED_USER_OPENIDS`.
+
+### Build From Source (Developers)
+
+If you want to build the tray EXE from source, clone the repository and run:
+
+```powershell
+git clone https://github.com/G-Photon/codex-remote-bridge.git
+cd codex-remote-bridge
+powershell -ExecutionPolicy Bypass -File .\client\build-tray-exe.ps1
+```
+
+The output is written to the project root:
+
+```text
+CodexRemoteBridgeTray.exe
+```
+
+Run that EXE to start the tray helper. The build script uses the PowerShell/.NET compiler available on Windows and does not require Visual Studio.
+
+For development and troubleshooting, you can also run the underlying startup script directly:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1
+```
+
+Check-only mode:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -CheckOnly
+```
+
+Background mode without a tray icon:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Background
+```
+
+If you do not want to build the EXE, a PowerShell tray script is available as a fallback:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\client\start-bridge-tray.ps1
 ```
 
 Before installing dependencies, the script checks environment variables, Windows proxy settings, git/npm proxy settings, and WinHTTP proxy settings. If a proxy is found, it asks whether to use it for downloads. If no proxy is detected, you can still enter one manually.
@@ -395,7 +446,7 @@ Node.js LTS          -> winget
 @openai/codex        -> npm install -g
 ```
 
-### Manual Setup
+### Manual Setup (Advanced)
 
 Install Python dependencies:
 
@@ -439,20 +490,18 @@ Leave it empty only if all users who can message the bot are allowed.
 
 ### Start
 
-If you use the one-click script, run `start.ps1` from the project root. The commands below are the lower-level manual startup options.
+Release users should run `CodexRemoteBridgeTray.exe`. The commands below are lower-level options for development and troubleshooting.
+
+Tray EXE:
+
+```powershell
+.\CodexRemoteBridgeTray.exe
+```
 
 Foreground:
 
 ```powershell
-cd client
-.\start-bridge.ps1
-```
-
-Background supervisor:
-
-```powershell
-cd client
-python .\qq_gateway_background.py
+powershell -ExecutionPolicy Bypass -File .\start.ps1
 ```
 
 Logs are written to:
@@ -468,9 +517,10 @@ client/data/qq-gateway-autostart.log
 Messages starting with `/` are handled locally by the bridge and are not sent to AI.
 
 ```text
+/start                       Show the entry panel, current model, and shortcut buttons
 /help                         Show available commands
 /status                       Show gateway, context, model, reasoning, permission
-/whoami                       Show current QQ Gateway openid
+/whoami                       Show current QQ Gateway openid for allowlist setup
 /model                        Show current model/reasoning
 /model gpt-5.5 high           Set model and reasoning
 /model gpt-5.4 xhigh          Set model and reasoning
@@ -496,20 +546,26 @@ Messages starting with `/` are handled locally by the bridge and are not sent to
 /pending                      Show pending approval requests
 /allow [id]                   Approve a pending request
 /reject [id]                  Reject a pending request
-/revise [id] <instruction>    Revise a pending request
+/revise <id> <instruction>    Revise a pending request and regenerate the approval plan
 /cancel                       Cancel current Codex task or pending request
 /cancel <task_id>             Cancel a specific Codex task
 /tasks                        Show running and queued Codex tasks
 /restart                      Restart the QQ Gateway client
-/resume                       List native Codex sessions
-/resume page 2                List page 2
-/resume <id>                  Switch to a Codex session
+/resume                       List native Codex sessions by directory
+/resume page 2                Show directory page 2
+/resume dir <dir>             Show sessions under a directory
+/resume <id>                  Switch to a native Codex session
+/recent                       Show the latest 5 messages in the current session
+/recent N S                   Show N messages starting at the S-th latest message (N=1-20, S optional)
+/recent N S <id>              Show that message window for a specific session
+/last user [N S]              Show recent user messages with paging
+/last codex [N S]             Show recent Codex replies with paging
 /new [title]                  Start a new Codex session
 /delete                       List sessions for deletion
 /delete <id>                  Archive/delete a session
 ```
 
-When QQ Markdown/Keyboard permissions are available, `/resume` and `/model` can return button cards. Enable interaction events in `client/.env`:
+When QQ Markdown/Keyboard permissions are available, commands such as `/start`, `/setup`, `/resume`, `/model`, `/tasks`, and `/permission` can return button cards. Enable interaction events in `client/.env`:
 
 ```env
 QQ_GATEWAY_INTENTS=100663296
