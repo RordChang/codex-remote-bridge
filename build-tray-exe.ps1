@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$OutputPath = ""
 )
 
@@ -12,7 +12,7 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
 }
 
 if (-not (Test-Path -LiteralPath $sourcePath)) {
-    throw "Tray source file not found: $sourcePath"
+    throw "找不到托盘程序源码：$sourcePath"
 }
 
 $outputDir = Split-Path -Parent $OutputPath
@@ -24,10 +24,10 @@ if (Test-Path -LiteralPath $OutputPath) {
     $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
     $backupPath = Join-Path $trashDir "CodexRemoteBridgeTray-$timestamp.exe"
     Move-Item -LiteralPath $OutputPath -Destination $backupPath -Force
-    Write-Host "Moved old EXE to: $backupPath" -ForegroundColor DarkYellow
+    Write-Host "已把旧 EXE 移动到：$backupPath" -ForegroundColor DarkYellow
 }
 
-Write-Host "Building tray EXE..." -ForegroundColor Cyan
+Write-Host "正在构建托盘 EXE..." -ForegroundColor Cyan
 Add-Type `
     -LiteralPath $sourcePath `
     -ReferencedAssemblies @(
@@ -40,5 +40,5 @@ Add-Type `
     -OutputAssembly $OutputPath `
     -OutputType WindowsApplication
 
-Write-Host "Build complete: $OutputPath" -ForegroundColor Green
-Write-Host "Run it to show Codex Remote Bridge in the Windows tray area." -ForegroundColor Green
+Write-Host "构建完成：$OutputPath" -ForegroundColor Green
+Write-Host "运行后会出现在 Windows 右下角托盘区域。" -ForegroundColor Green
