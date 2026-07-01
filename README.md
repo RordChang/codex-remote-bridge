@@ -8,46 +8,25 @@ Local QQ Gateway bridge for Codex CLI.
 
 ## 中文说明
 
-### 简介
+### 快速开始
 
-这个项目会在 Windows 本机连接 QQ 官方 Bot WebSocket Gateway，收到 QQ 消息后调用本机 `codex exec`，再通过 QQ 官方 Bot API 把结果回复回去。
+#### 方式 1：下载 Release 运行
 
-它不需要公网回调地址，也不需要远程 relay 服务器。
-
-### 架构
-
-```text
-QQ Bot Gateway
--> client/qq_gateway_client.py
--> codex exec / codex exec resume
--> QQ Bot send-message API
-```
-
-默认使用 Codex 原生会话续接模式：
-
-```env
-CODEX_CONTEXT_MODE=native
-```
-
-在 `native` 模式下，普通 QQ 消息会触发一次 `codex exec`。如果已经存在 active Codex session，桥接器会使用 `codex exec resume <session-id>`，让消息接着同一个 Codex 对话继续。
-
-兼容用的本地 prompt-history 模式仍然保留：
-
-```env
-CODEX_CONTEXT_MODE=prompt
-```
-
-### Windows 快速开始（推荐）
-
-普通用户建议直接下载发布包，不需要先 clone 仓库，也不需要自己编译。
-
-1. 打开本仓库的 [Releases](https://github.com/G-Photon/codex-remote-bridge/releases) 页面。
+1. 打开 [Releases](https://github.com/RordChang/codex-remote-bridge/releases) 页面。
 2. 下载最新的 Windows 发布包，例如 `codex-remote-bridge-*.zip`。
 3. 解压到一个固定目录，例如 `D:\Tools\CodexRemoteBridge`。
 4. 双击运行解压目录里的 `CodexRemoteBridgeTray.exe`。
 5. 按托盘菜单提示完成安装、检查和配置。
 
+如果不需要托盘，也可以在解压目录直接前台运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1
+```
+
 首次运行时，托盘程序会自动调用项目里的 `start.ps1` 完成环境检查和配置。缺少 Python、`websocket-client`、Codex CLI、Node.js/npm 等组件时，脚本会先询问用户，确认后再自动安装。
+
+托盘程序启动后会直接尝试启动桥接，并通过 QQ Gateway READY 和心跳状态判断是否在线。状态显示为绿色表示已在线；黄色表示仍在连接、配置异常或状态超过阈值未刷新；红色表示桥接未运行。运行态状态文件只保存在本地 `client/data/qq-gateway-status.json`，不会进入 Git 或发布包。
 
 右键 Windows 右下角托盘图标可以：
 
@@ -80,12 +59,12 @@ https://q.qq.com/#/
 
 然后把返回的 `user_openid` 写入配置里的 `QQ_ALLOWED_USER_OPENIDS`。
 
-### 源码构建（开发者）
+#### 方式 2：从源码编译 EXE
 
 如果你想从源码构建托盘 EXE，可以 clone 仓库后运行：
 
 ```powershell
-git clone https://github.com/G-Photon/codex-remote-bridge.git
+git clone https://github.com/RordChang/codex-remote-bridge.git
 cd codex-remote-bridge
 powershell -ExecutionPolicy Bypass -File .\build-tray-exe.ps1
 ```
@@ -97,6 +76,37 @@ CodexRemoteBridgeTray.exe
 ```
 
 然后双击运行这个 EXE 即可。构建脚本使用 Windows 自带的 PowerShell/.NET 编译能力，不需要额外安装 Visual Studio。
+
+### 简介
+
+这个项目会在 Windows 本机连接 QQ 官方 Bot WebSocket Gateway，收到 QQ 消息后调用本机 `codex exec`，再通过 QQ 官方 Bot API 把结果回复回去。
+
+它不需要公网回调地址，也不需要远程 relay 服务器。
+
+### 架构
+
+```text
+QQ Bot Gateway
+-> client/qq_gateway_client.py
+-> codex exec / codex exec resume
+-> QQ Bot send-message API
+```
+
+默认使用 Codex 原生会话续接模式：
+
+```env
+CODEX_CONTEXT_MODE=native
+```
+
+在 `native` 模式下，普通 QQ 消息会触发一次 `codex exec`。如果已经存在 active Codex session，桥接器会使用 `codex exec resume <session-id>`，让消息接着同一个 Codex 对话继续。
+
+兼容用的本地 prompt-history 模式仍然保留：
+
+```env
+CODEX_CONTEXT_MODE=prompt
+```
+
+### 启动和排障
 
 开发或排障时，也可以直接运行底层启动脚本：
 
@@ -116,6 +126,8 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -CheckOnly
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Background
 ```
 
+`start.ps1` 只负责检查、配置和启动桥接，不再配置 Windows 登录自启动。需要开机自启动时，请使用托盘菜单里的“开启开机自启动”，它会启动 `CodexRemoteBridgeTray.exe`。
+
 自动安装依赖前，脚本会检查环境变量、Windows 代理、git/npm 代理和 WinHTTP 代理。如果检测到代理，会询问是否用于下载安装；如果没有检测到，也可以手动输入代理地址。
 
 安装过程中会显示当前安装阶段和进度提示。`pip` 和 `npm` 会尽量显示自身下载进度，`winget` 安装会显示脚本侧进度，避免用户无法判断是否仍在执行。
@@ -129,22 +141,15 @@ Node.js LTS          -> winget
 @openai/codex        -> npm install -g
 ```
 
-### 手动安装（高级）
+### 手动配置（高级）
 
-安装 Python 依赖：
-
-```powershell
-pip install websocket-client
-```
-
-创建本地配置：
+通常不需要手动创建配置文件。推荐运行下面的检查流程，让脚本生成并维护 `client/.env`：
 
 ```powershell
-cd client
-Copy-Item .env.example .env
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -CheckOnly
 ```
 
-编辑 `client/.env`：
+脚本会提示填写 QQ Bot 的 `QQ_APP_ID` 和 `QQ_APP_SECRET`，并写入 `client/.env`。如果你确实需要手动编辑，最小配置如下：
 
 ```env
 QQ_APP_ID=replace-with-qq-app-id
@@ -154,6 +159,12 @@ CODEX_CONTEXT_MODE=native
 CODEX_MODEL=gpt-5.5
 CODEX_REASONING_EFFORT=xhigh
 CODEX_PERMISSION=read-only
+```
+
+然后安装 Python 依赖：
+
+```powershell
+pip install websocket-client
 ```
 
 如果要限制谁能使用机器人，先给机器人发送：
@@ -206,6 +217,8 @@ client/data/qq-gateway-autostart.log
 /model                        显示当前模型和思考强度
 /model gpt-5.5 high           设置模型和思考强度
 /model gpt-5.4 xhigh          设置模型和思考强度
+/ci <内容>                    强制把后续内容发送给 Codex，适合转发 Codex/SkillKit slash 命令
+/codexInstruction <内容>      /ci 的完整写法，例如 /ci /wiki init xxx
 /setup                        显示设置面板
 /output                       显示输出设置
 /output stage on/off          开关阶段性输出
@@ -282,6 +295,9 @@ QQ_SEND_IMAGE_MAX_BYTES=10485760
 ```env
 QQ_JOB_QUEUE_SIZE=20
 QQ_CODEX_MAX_PARALLEL=5
+QQ_HEALTH_CHECK_INTERVAL_SECONDS=60
+QQ_READY_TIMEOUT_SECONDS=8
+QQ_GATEWAY_STALE_SECONDS=180
 QQ_TASK_STATUS_INTERVAL_SECONDS=300
 QQ_TASK_PARTIAL_INTERVAL_SECONDS=60
 QQ_TASK_PARTIAL_MAX_CHARS=1200
@@ -289,6 +305,10 @@ QQ_SEND_PARTIAL_OUTPUTS=0
 QQ_SHOW_TASK_CONTEXT_ON_FINAL=1
 QQ_TRUNCATE_LONG_REPLIES=1
 ```
+
+`QQ_READY_TIMEOUT_SECONDS` controls READY wait timeout and defaults to 8 seconds. `QQ_GATEWAY_STALE_SECONDS` controls stale Gateway heartbeat detection and defaults to 180 seconds. The tray helper also runs a health check every 60 seconds and tries to recover when the bridge process is missing, READY fails, or the status file becomes stale.
+
+`QQ_READY_TIMEOUT_SECONDS` 用于 READY 等待超时，默认 8 秒。`QQ_GATEWAY_STALE_SECONDS` 用于判断 Gateway 心跳状态是否长时间未刷新，默认 180 秒。托盘程序还会每 60 秒做一次健康检查，发现进程丢失、READY 失败或状态过期时尝试自动恢复。
 
 ### 权限映射
 
@@ -312,46 +332,25 @@ approve   -> 兼容旧命令，等同 auto
 
 ## English
 
-### Overview
+### Quick Start
 
-This project connects to the official QQ Bot WebSocket Gateway from a Windows machine, receives QQ messages, runs local `codex exec`, and sends the result back through the official QQ Bot API.
+#### Option 1: Download Release and Run
 
-It does not require a public callback URL or a remote relay server.
-
-### Architecture
-
-```text
-QQ Bot Gateway
--> client/qq_gateway_client.py
--> codex exec / codex exec resume
--> QQ Bot send-message API
-```
-
-The default context mode is native Codex session resume:
-
-```env
-CODEX_CONTEXT_MODE=native
-```
-
-In `native` mode, normal QQ messages run `codex exec`. If an active Codex session exists, the bridge uses `codex exec resume <session-id>` so messages continue in the same Codex conversation.
-
-Local prompt-history mode is still available for compatibility:
-
-```env
-CODEX_CONTEXT_MODE=prompt
-```
-
-### Windows Quick Start (Recommended)
-
-Most users should use the release package instead of cloning and building the repository.
-
-1. Open the repository [Releases](https://github.com/G-Photon/codex-remote-bridge/releases) page.
+1. Open the [Releases](https://github.com/RordChang/codex-remote-bridge/releases) page.
 2. Download the latest Windows package, for example `codex-remote-bridge-*.zip`.
 3. Extract it to a stable directory, for example `D:\Tools\CodexRemoteBridge`.
 4. Double-click `CodexRemoteBridgeTray.exe` in the extracted directory.
 5. Follow the tray menu prompts to install, check, and configure the bridge.
 
+If you do not need the tray helper, you can run the foreground script directly from the extracted directory:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1
+```
+
 On first run, the tray helper calls the bundled `start.ps1` script for environment checks and configuration. If Python, `websocket-client`, Codex CLI, Node.js/npm, or other required components are missing, the script asks before installing them automatically.
+
+After startup, the tray helper immediately tries to start the bridge and uses QQ Gateway READY plus heartbeat state to decide whether it is online. Green means online; yellow means connecting, configuration failure, or stale status; red means the bridge is not running. The runtime status file is local-only at `client/data/qq-gateway-status.json` and is not included in Git or release packages.
 
 Right-click the Windows tray icon to:
 
@@ -384,12 +383,12 @@ To restrict who can use the bot, start it and send this message to the bot:
 
 Then put the returned `user_openid` into `QQ_ALLOWED_USER_OPENIDS`.
 
-### Build From Source (Developers)
+#### Option 2: Build EXE From Source
 
 If you want to build the tray EXE from source, clone the repository and run:
 
 ```powershell
-git clone https://github.com/G-Photon/codex-remote-bridge.git
+git clone https://github.com/RordChang/codex-remote-bridge.git
 cd codex-remote-bridge
 powershell -ExecutionPolicy Bypass -File .\build-tray-exe.ps1
 ```
@@ -401,6 +400,37 @@ CodexRemoteBridgeTray.exe
 ```
 
 Run that EXE to start the tray helper. The build script uses the PowerShell/.NET compiler available on Windows and does not require Visual Studio.
+
+### Overview
+
+This project connects to the official QQ Bot WebSocket Gateway from a Windows machine, receives QQ messages, runs local `codex exec`, and sends the result back through the official QQ Bot API.
+
+It does not require a public callback URL or a remote relay server.
+
+### Architecture
+
+```text
+QQ Bot Gateway
+-> client/qq_gateway_client.py
+-> codex exec / codex exec resume
+-> QQ Bot send-message API
+```
+
+The default context mode is native Codex session resume:
+
+```env
+CODEX_CONTEXT_MODE=native
+```
+
+In `native` mode, normal QQ messages run `codex exec`. If an active Codex session exists, the bridge uses `codex exec resume <session-id>` so messages continue in the same Codex conversation.
+
+Local prompt-history mode is still available for compatibility:
+
+```env
+CODEX_CONTEXT_MODE=prompt
+```
+
+### Startup and Troubleshooting
 
 For development and troubleshooting, you can also run the underlying startup script directly:
 
@@ -420,6 +450,8 @@ Background mode without a tray icon:
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -Background
 ```
 
+`start.ps1` only checks, configures, and starts the bridge. It no longer configures Windows startup at login. Use the tray menu "Enable startup at login" when you want Windows to launch `CodexRemoteBridgeTray.exe`.
+
 Before installing dependencies, the script checks environment variables, Windows proxy settings, git/npm proxy settings, and WinHTTP proxy settings. If a proxy is found, it asks whether to use it for downloads. If no proxy is detected, you can still enter one manually.
 
 During installation, the script displays the current step and progress status. `pip` and `npm` use their own download progress when possible; `winget` uses script-side progress messages so users can see that installation is still running.
@@ -433,22 +465,15 @@ Node.js LTS          -> winget
 @openai/codex        -> npm install -g
 ```
 
-### Manual Setup (Advanced)
+### Manual Configuration (Advanced)
 
-Install Python dependencies:
-
-```powershell
-pip install websocket-client
-```
-
-Create local config:
+You usually do not need to create the config file manually. Prefer running the check flow so the script can generate and maintain `client/.env`:
 
 ```powershell
-cd client
-Copy-Item .env.example .env
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -CheckOnly
 ```
 
-Edit `client/.env`:
+The script prompts for QQ Bot `QQ_APP_ID` and `QQ_APP_SECRET` and writes them to `client/.env`. If you need to edit it manually, the minimal config is:
 
 ```env
 QQ_APP_ID=replace-with-qq-app-id
@@ -458,6 +483,12 @@ CODEX_CONTEXT_MODE=native
 CODEX_MODEL=gpt-5.5
 CODEX_REASONING_EFFORT=xhigh
 CODEX_PERMISSION=read-only
+```
+
+Then install Python dependencies:
+
+```powershell
+pip install websocket-client
 ```
 
 To restrict who can use the bot, send this message to the bot first:
@@ -510,6 +541,8 @@ Messages starting with `/` are handled locally by the bridge and are not sent to
 /model                        Show current model/reasoning
 /model gpt-5.5 high           Set model and reasoning
 /model gpt-5.4 xhigh          Set model and reasoning
+/ci <text>                    Force-send following text to Codex; useful for Codex/SkillKit slash commands
+/codexInstruction <text>      Full form of /ci, for example /ci /wiki init xxx
 /setup                        Show settings panel
 /output                       Show output settings
 /output stage on/off          Toggle partial output
@@ -586,6 +619,9 @@ Normal Codex messages are enqueued and immediately return a `task_id` with task-
 ```env
 QQ_JOB_QUEUE_SIZE=20
 QQ_CODEX_MAX_PARALLEL=5
+QQ_HEALTH_CHECK_INTERVAL_SECONDS=60
+QQ_READY_TIMEOUT_SECONDS=8
+QQ_GATEWAY_STALE_SECONDS=180
 QQ_TASK_STATUS_INTERVAL_SECONDS=300
 QQ_TASK_PARTIAL_INTERVAL_SECONDS=60
 QQ_TASK_PARTIAL_MAX_CHARS=1200

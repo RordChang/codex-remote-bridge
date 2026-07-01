@@ -370,6 +370,71 @@ function Invoke-PythonCapture {
     }
 }
 
+function Test-QQGatewayReady {
+    param(
+        [string[]]$PythonCommand,
+        [string]$ClientDir,
+        [int]$TimeoutSeconds = 8
+    )
+
+    Write-Step "验证 QQ Bot 凭据和 Gateway 在线状态"
+    Write-Host "正在校验 QQ_APP_ID / QQ_APP_SECRET，并等待 Gateway READY，最多 $TimeoutSeconds 秒。"
+    $health = Invoke-PythonCapture -PythonCommand $PythonCommand -Arguments @(".\qq_gateway_client.py", "--check-qq-ready", "--timeout", "$TimeoutSeconds") -WorkingDirectory $ClientDir
+    if ($health.Output) {
+        Write-Host $health.Output
+    }
+    if ($health.ExitCode -ne 0) {
+        throw "QQ Bot 在线检查失败。请确认 QQ_APP_ID / QQ_APP_SECRET 正确、机器人 Gateway 事件已开启，并检查网络或代理。"
+    }
+    Write-Ok "QQ Bot 凭据有效，Gateway 已返回 READY"
+}
+
+function Wait-BridgeBackgroundReady {
+    param(
+        [string]$LogFile,
+        [string]$Marker,
+        [int]$TimeoutSeconds = 12
+    )
+
+    Write-Step "等待后台 QQ Gateway READY"
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path -LiteralPath $LogFile) {
+            $tail = @(Get-Content -LiteralPath $LogFile -Tail 120 -Encoding UTF8 -ErrorAction SilentlyContinue)
+            if (-not [string]::IsNullOrWhiteSpace($Marker)) {
+                $markerIndex = -1
+                for ($i = $tail.Count - 1; $i -ge 0; $i--) {
+                    if ([string]$tail[$i] -match [regex]::Escape($Marker)) {
+                        $markerIndex = $i
+                        break
+                    }
+                }
+                if ($markerIndex -ge 0) {
+                    $tail = $tail[$markerIndex..($tail.Count - 1)]
+                } else {
+                    $tail = @()
+                }
+            }
+            if ($tail -match "\[gateway\] READY|\[gateway\] RESUMED") {
+                Write-Ok "后台 QQ Gateway 已在线"
+                return
+            }
+            if ($tail -match "\[health-error\]|config error:|\[gateway-loop-error\]|\[gateway-error\]") {
+                Write-WarnLine "后台日志出现错误，最近日志如下："
+                $tail | Select-Object -Last 80 | ForEach-Object { Write-Host $_ }
+                throw "后台 QQ Gateway 启动失败。"
+            }
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    if (Test-Path -LiteralPath $LogFile) {
+        Write-WarnLine "等待 READY 超时，最近日志如下："
+        Get-Content -LiteralPath $LogFile -Tail 80 -Encoding UTF8
+    }
+    throw "后台 QQ Gateway 未在 $TimeoutSeconds 秒内进入 READY 状态。"
+}
+
 function Ensure-WingetPackage {
     param(
         [string]$PackageId,
@@ -645,6 +710,9 @@ function Write-EnvFile {
         "QQ_ALLOWED_EVENTS=$(Get-EnvValue -Map $Existing -Key 'QQ_ALLOWED_EVENTS' -DefaultValue 'C2C_MESSAGE_CREATE,GROUP_AT_MESSAGE_CREATE')",
         "QQ_REPLY_MAX_CHARS=$(Get-EnvValue -Map $Existing -Key 'QQ_REPLY_MAX_CHARS' -DefaultValue '1500')",
         "QQ_MAX_REPLY_CHUNKS=$(Get-EnvValue -Map $Existing -Key 'QQ_MAX_REPLY_CHUNKS' -DefaultValue '5')",
+        "QQ_HEALTH_CHECK_INTERVAL_SECONDS=$(Get-EnvValue -Map $Existing -Key 'QQ_HEALTH_CHECK_INTERVAL_SECONDS' -DefaultValue '60')",
+        "QQ_READY_TIMEOUT_SECONDS=$(Get-EnvValue -Map $Existing -Key 'QQ_READY_TIMEOUT_SECONDS' -DefaultValue '8')",
+        "QQ_GATEWAY_STALE_SECONDS=$(Get-EnvValue -Map $Existing -Key 'QQ_GATEWAY_STALE_SECONDS' -DefaultValue '180')",
         "QQ_JOB_QUEUE_SIZE=$(Get-EnvValue -Map $Existing -Key 'QQ_JOB_QUEUE_SIZE' -DefaultValue '20')",
         "QQ_CODEX_MAX_PARALLEL=$(Get-EnvValue -Map $Existing -Key 'QQ_CODEX_MAX_PARALLEL' -DefaultValue '5')",
         "QQ_TASK_STATUS_INTERVAL_SECONDS=$(Get-EnvValue -Map $Existing -Key 'QQ_TASK_STATUS_INTERVAL_SECONDS' -DefaultValue '300')",
@@ -709,142 +777,6 @@ function Ensure-EnvConfig {
     Write-Host "  CODEX_COMMAND=$CodexCommand"
     Write-Host "  QQ_APP_ID=$appId"
     Write-Host "  QQ_APP_SECRET=(已隐藏)"
-}
-
-function Read-DeployPreferences {
-    param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return @{}
-    }
-    try {
-        $json = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
-        $map = @{}
-        foreach ($property in $json.PSObject.Properties) {
-            $map[$property.Name] = $property.Value
-        }
-        return $map
-    } catch {
-        Write-WarnLine "无法读取部署偏好，将忽略：$Path"
-        return @{}
-    }
-}
-
-function Write-DeployPreferences {
-    param(
-        [string]$Path,
-        [hashtable]$Preferences
-    )
-    $dir = Split-Path -Parent $Path
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $Preferences | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Path -Encoding UTF8
-}
-
-function Test-AutostartTaskConfigured {
-    param(
-        [string]$TaskName,
-        [string]$AutostartScript
-    )
-    if (-not (Test-Path -LiteralPath $AutostartScript)) {
-        return $false
-    }
-
-    try {
-        $expectedScript = (Resolve-Path -LiteralPath $AutostartScript).Path
-        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        if ($null -eq $task) {
-            return $false
-        }
-        if ([string]$task.State -eq "Disabled") {
-            return $false
-        }
-
-        $hasExpectedAction = $false
-        foreach ($action in @($task.Actions)) {
-            $arguments = [string]$action.Arguments
-            if ($arguments.IndexOf($expectedScript, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                $hasExpectedAction = $true
-                break
-            }
-        }
-        if (-not $hasExpectedAction) {
-            return $false
-        }
-
-        $enabledTriggers = @($task.Triggers | Where-Object { $_.Enabled -ne $false })
-        return $enabledTriggers.Count -gt 0
-    } catch {
-        Write-WarnLine "无法验证自启动任务，将继续询问：$($_.Exception.Message)"
-        return $false
-    }
-}
-
-function Ensure-AutostartTask {
-    param(
-        [string]$TaskName,
-        [string]$AutostartScript
-    )
-    if (-not (Test-Path -LiteralPath $AutostartScript)) {
-        throw "找不到自启动脚本：$AutostartScript"
-    }
-
-    Write-Step "配置 Windows 登录自启动"
-    $powershellPath = Join-Path $PSHOME "powershell.exe"
-    if (-not (Test-Path -LiteralPath $powershellPath)) {
-        $powershellPath = "powershell.exe"
-    }
-
-    $action = New-ScheduledTaskAction `
-        -Execute $powershellPath `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$AutostartScript`" -Background"
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-    $settings = New-ScheduledTaskSettingsSet `
-        -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries `
-        -MultipleInstances IgnoreNew `
-        -ExecutionTimeLimit (New-TimeSpan -Days 0)
-
-    Register-ScheduledTask `
-        -TaskName $TaskName `
-        -Action $action `
-        -Trigger $trigger `
-        -Settings $settings `
-        -Description "用户登录时启动 Codex Remote Bridge。" `
-        -Force | Out-Null
-
-    Write-Ok "自启动任务已配置：$TaskName"
-    Write-Host "  脚本：$AutostartScript"
-}
-
-function Maybe-ConfigureAutostart {
-    param(
-        [string]$PreferencesPath,
-        [string]$AutostartScript
-    )
-    $taskName = "CodexRemoteBridge"
-    if (Test-AutostartTaskConfigured -TaskName $taskName -AutostartScript $AutostartScript) {
-        Write-Ok "已检测到本项目的自启动任务处于启用状态，跳过自启动询问。"
-        return
-    }
-
-    $preferences = Read-DeployPreferences -Path $PreferencesPath
-    if ([string]$preferences["autostart_prompt"] -eq "never") {
-        Write-Ok "你之前选择过 never，本次跳过自启动询问。"
-        return
-    }
-
-    $choice = Read-YesNoNever -Question "是否要配置 Windows 登录后自启动 Codex Remote Bridge？"
-    if ($choice -eq "never") {
-        $preferences["autostart_prompt"] = "never"
-        Write-DeployPreferences -Path $PreferencesPath -Preferences $preferences
-        Write-Ok "已保存偏好：以后不再询问自启动。"
-        return
-    }
-    if ($choice -eq "no") {
-        Write-Host "本次不配置自启动。下次运行脚本仍会再次询问。"
-        return
-    }
-
-    Ensure-AutostartTask -TaskName $taskName -AutostartScript $AutostartScript
 }
 
 function Show-QuickStartHelp {
@@ -1002,12 +934,15 @@ function Start-BridgeBackground {
         [string]$LogFile
     )
     Write-Step "以后台模式启动 QQ Gateway"
+    $marker = "start-marker " + [guid]::NewGuid().ToString("N")
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogFile) | Out-Null
+    Add-Content -LiteralPath $LogFile -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] start.ps1: $marker" -Encoding UTF8
     $exe = $PythonCommand[0]
     $args = @(Get-TailArgs -Command $PythonCommand)
     $args += @("-B", (Join-Path $ClientDir "qq_gateway_background.py"))
     Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $ClientDir -WindowStyle Hidden | Out-Null
-    Start-Sleep -Seconds 3
-    Write-Ok "后台守护进程已启动"
+    Wait-BridgeBackgroundReady -LogFile $LogFile -Marker $marker -TimeoutSeconds 12
+    Write-Ok "后台守护进程已启动并确认在线"
     if (Test-Path -LiteralPath $LogFile) {
         Write-Host ""
         Write-Host "最近日志：$LogFile" -ForegroundColor Cyan
@@ -1026,9 +961,6 @@ $clientDir = Join-Path $root "client"
 $envPath = Join-Path $clientDir ".env"
 $dataDir = Join-Path $clientDir "data"
 $logFile = Join-Path $dataDir "qq-gateway-autostart.log"
-$preferencesPath = Join-Path $dataDir "deploy-preferences.json"
-$autostartScript = $MyInvocation.MyCommand.Path
-
 if (-not (Test-Path -LiteralPath $clientDir)) {
     throw "找不到 client 目录：$clientDir"
 }
@@ -1061,6 +993,8 @@ if ($commandCheck.ExitCode -ne 0) {
 }
 Write-Ok "本地验证通过"
 
+Test-QQGatewayReady -PythonCommand $python -ClientDir $clientDir -TimeoutSeconds 8
+
 if ($CheckOnly) {
     Write-Step "仅检查模式"
     Write-Host "配置和本地验证已完成。"
@@ -1070,8 +1004,6 @@ if ($CheckOnly) {
     Write-Host "  powershell -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`" -Background"
     exit 0
 }
-
-Maybe-ConfigureAutostart -PreferencesPath $preferencesPath -AutostartScript $autostartScript
 
 if ($Background) {
     Show-QuickStartHelp -LogFile $logFile -IsBackground $true

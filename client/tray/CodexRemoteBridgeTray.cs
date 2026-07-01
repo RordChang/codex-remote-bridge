@@ -42,18 +42,25 @@ internal sealed class TrayContext : ApplicationContext
     private readonly string rootDir;
     private readonly string dataDir;
     private readonly string logFile;
+    private readonly string statusFile;
     private readonly string configFile;
     private readonly string startScript;
     private readonly string backgroundScript;
     private readonly NotifyIcon notifyIcon;
     private readonly System.Windows.Forms.Timer timer;
     private readonly System.Windows.Forms.Timer autoStartTimer;
+    private readonly System.Windows.Forms.Timer healthTimer;
     private readonly ToolStripMenuItem statusItem;
     private readonly ToolStripMenuItem autostartItem;
     private readonly Icon runningIcon;
     private readonly Icon stoppedIcon;
+    private readonly Icon warningIcon;
     private int autoStartAttempts;
     private bool environmentPromptShown;
+    private bool bridgeShouldRun;
+    private DateTime lastStartAttemptUtc = DateTime.MinValue;
+    private DateTime lastRepairAttemptUtc = DateTime.MinValue;
+    private string lastStatusSnapshot = "";
 
     public TrayContext()
     {
@@ -62,6 +69,7 @@ internal sealed class TrayContext : ApplicationContext
         rootDir = Directory.GetParent(clientDir).FullName;
         dataDir = Path.Combine(clientDir, "data");
         logFile = Path.Combine(dataDir, "qq-gateway-autostart.log");
+        statusFile = Path.Combine(dataDir, "qq-gateway-status.json");
         configFile = Path.Combine(clientDir, ".env");
         startScript = Path.Combine(rootDir, "start.ps1");
         backgroundScript = Path.Combine(clientDir, "qq_gateway_background.py");
@@ -70,6 +78,7 @@ internal sealed class TrayContext : ApplicationContext
         WriteLog("托盘程序启动");
         runningIcon = CreateStatusIcon(true);
         stoppedIcon = CreateStatusIcon(false);
+        warningIcon = CreateStatusIcon(Color.FromArgb(221, 151, 42));
 
         var menu = new ContextMenuStrip();
         statusItem = new ToolStripMenuItem("状态：检测中") { Enabled = false };
@@ -109,6 +118,10 @@ internal sealed class TrayContext : ApplicationContext
         autoStartTimer = new System.Windows.Forms.Timer { Interval = 5000 };
         autoStartTimer.Tick += delegate { AutoStartBridgeTick(); };
 
+        healthTimer = new System.Windows.Forms.Timer { Interval = 60000 };
+        healthTimer.Tick += delegate { HealthCheckTick(); };
+        healthTimer.Start();
+
         RefreshStatus();
         AutoStartBridgeTick();
     }
@@ -133,18 +146,38 @@ internal sealed class TrayContext : ApplicationContext
     private void RefreshStatus()
     {
         bool running = GetBridgeProcesses().Any();
-        statusItem.Text = running ? "状态：运行中" : "状态：未运行";
+        BridgeLogStatus logStatus = ReadBridgeLogStatus();
+        bool online = running && logStatus.IsReady;
+        bool failed = running && (logStatus.HasRecentError || logStatus.IsStale) && !logStatus.IsReady;
+        statusItem.Text = online ? "状态：已在线" : (failed ? "状态：异常，请查看日志" : (running ? "状态：连接中" : "状态：未运行"));
         autostartItem.Text = IsAutostartConfigured() ? "开机自启动：已开启" : "开机自启动：未开启";
-        notifyIcon.Text = running ? "Codex Remote Bridge：运行中" : "Codex Remote Bridge：未运行";
+        notifyIcon.Text = online ? "Codex Remote Bridge：已在线" : (failed ? "Codex Remote Bridge：异常" : (running ? "Codex Remote Bridge：连接中" : "Codex Remote Bridge：未运行"));
 
-        notifyIcon.Icon = running ? runningIcon : stoppedIcon;
+        notifyIcon.Icon = online ? runningIcon : (running ? warningIcon : stoppedIcon);
+        LogStatusSnapshot(running, logStatus, online, failed);
     }
 
     private void ShowStatusBalloon()
     {
         bool running = GetBridgeProcesses().Any();
+        BridgeLogStatus logStatus = ReadBridgeLogStatus();
         notifyIcon.BalloonTipTitle = "Codex Remote Bridge";
-        notifyIcon.BalloonTipText = running ? "后台正在运行。右键图标可停止、重启或打开日志。" : "后台未运行。右键图标可启动或打开配置检查。";
+        if (running && logStatus.IsReady)
+        {
+            notifyIcon.BalloonTipText = "QQ Gateway 已在线。右键图标可停止、重启或打开日志。";
+        }
+        else if (running && logStatus.IsStale)
+        {
+            notifyIcon.BalloonTipText = "后台进程存在，但状态超过 " + logStatus.AgeSeconds + " 秒未刷新。健康检查会尝试自动恢复。";
+        }
+        else if (running)
+        {
+            notifyIcon.BalloonTipText = "后台进程存在，但尚未确认 QQ Gateway READY。请打开日志查看凭据、网络或 Gateway 事件配置。";
+        }
+        else
+        {
+            notifyIcon.BalloonTipText = "后台未运行。右键图标可启动或打开配置检查。";
+        }
         notifyIcon.ShowBalloonTip(2500);
     }
 
@@ -216,6 +249,7 @@ internal sealed class TrayContext : ApplicationContext
 
     private void StartBridgeBackground(bool manual)
     {
+        bridgeShouldRun = true;
         if (GetBridgeProcesses().Any())
         {
             WriteLog("启动请求：后台已在运行");
@@ -253,9 +287,10 @@ internal sealed class TrayContext : ApplicationContext
 
         try
         {
+            lastStartAttemptUtc = DateTime.UtcNow;
             using (Process process = Process.Start(psi))
             {
-                if (!process.WaitForExit(30000))
+                if (!process.WaitForExit(15000))
                 {
                     try
                     {
@@ -264,7 +299,7 @@ internal sealed class TrayContext : ApplicationContext
                     catch
                     {
                     }
-                    WriteLog("启动命令 30 秒内未返回，将继续按非环境错误重试");
+                    WriteLog("启动命令 15 秒内未返回，将继续按非环境错误重试");
                     return;
                 }
 
@@ -276,12 +311,19 @@ internal sealed class TrayContext : ApplicationContext
 
                 if (process.ExitCode == 20)
                 {
+                    bridgeShouldRun = false;
                     HandleEnvironmentMissing(resultText, manual);
                     return;
                 }
                 if (process.ExitCode != 0)
                 {
                     WriteLog("启动命令失败，退出码 " + process.ExitCode);
+                    if (IsQQConfigFailure(resultText))
+                    {
+                        bridgeShouldRun = false;
+                        HandleQQConfigFailure(resultText, manual);
+                        return;
+                    }
                     if (manual)
                     {
                         MessageBox.Show("桥接启动失败，请查看日志。", "Codex Remote Bridge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -302,13 +344,57 @@ internal sealed class TrayContext : ApplicationContext
         }
     }
 
+    private void HandleQQConfigFailure(string detail, bool manual)
+    {
+        autoStartTimer.Stop();
+        WriteLog("检测到 QQ Bot 配置或 Gateway 验证失败：" + detail);
+        DialogResult result = MessageBox.Show(
+            "QQ Bot 凭据或 Gateway 配置验证失败，是否重新配置？\n\n常见原因：QQ_APP_ID / QQ_APP_SECRET 填错、机器人 Gateway 事件未开启，或网络无法连接 QQ Gateway。",
+            "Codex Remote Bridge",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning);
+        if (result == DialogResult.Yes)
+        {
+            RunStartScript("-Reconfigure", false);
+        }
+        else if (manual)
+        {
+            MessageBox.Show("已取消重新配置。可稍后右键托盘图标打开日志或运行安装/检查/配置。", "Codex Remote Bridge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+    }
+
+    private static bool IsQQConfigFailure(string text)
+    {
+        string lower = (text ?? "").ToLowerInvariant();
+        if (lower.Contains("100017") || lower.Contains("频率限制") || lower.Contains("rate limit"))
+        {
+            return false;
+        }
+        return lower.Contains("start_failed") &&
+               (lower.Contains("qq token check failed") ||
+                lower.Contains("appid invalid") ||
+                lower.Contains("appsecret") ||
+                lower.Contains("clientsecret") ||
+                lower.Contains("access_token") ||
+                lower.Contains("getappaccesstoken") ||
+                lower.Contains("gateway ready check failed") ||
+                lower.Contains("qq gateway") ||
+                lower.Contains("gateway ready") ||
+                lower.Contains("websocket") ||
+                lower.Contains("http 401") ||
+                lower.Contains("http 403") ||
+                lower.Contains("\"code\""));
+    }
+
     private void AutoStartBridgeTick()
     {
         RefreshStatus();
-        if (GetBridgeProcesses().Any())
+        BridgeLogStatus logStatus = ReadBridgeLogStatus();
+        if (GetBridgeProcesses().Any() && logStatus.IsReady)
         {
             autoStartTimer.Stop();
-            WriteLog("自动启动检查：桥接已运行");
+            bridgeShouldRun = true;
+            WriteLog("自动启动检查：桥接已在线");
             return;
         }
 
@@ -316,9 +402,9 @@ internal sealed class TrayContext : ApplicationContext
         if (autoStartAttempts > 24)
         {
             autoStartTimer.Stop();
-            WriteLog("自动启动检查：120 秒后仍未检测到桥接进程");
+            WriteLog("自动启动检查：120 秒后仍未确认桥接在线");
             MessageBox.Show(
-                "桥接 120 秒内未能自动启动，请查看日志或右键托盘图标手动启动。",
+                "桥接 120 秒内未能确认在线，请查看日志或右键托盘图标手动启动。",
                 "Codex Remote Bridge",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Warning);
@@ -331,13 +417,64 @@ internal sealed class TrayContext : ApplicationContext
         RefreshStatus();
         if (GetBridgeProcesses().Any())
         {
-            autoStartTimer.Stop();
-            WriteLog("自动启动成功");
+            if (ReadBridgeLogStatus().IsReady)
+            {
+                autoStartTimer.Stop();
+                bridgeShouldRun = true;
+                WriteLog("自动启动成功");
+            }
             return;
         }
         if (!autoStartTimer.Enabled)
         {
             autoStartTimer.Start();
+        }
+    }
+
+    private void HealthCheckTick()
+    {
+        RefreshStatus();
+        if (!bridgeShouldRun)
+        {
+            return;
+        }
+
+        bool running = GetBridgeProcesses().Any();
+        BridgeLogStatus status = ReadBridgeLogStatus();
+        if (running && status.IsReady)
+        {
+            return;
+        }
+
+        TimeSpan sinceLastRepair = DateTime.UtcNow - lastRepairAttemptUtc;
+        if (sinceLastRepair.TotalSeconds < 60)
+        {
+            return;
+        }
+
+        if (!running)
+        {
+            lastRepairAttemptUtc = DateTime.UtcNow;
+            WriteLog("健康检查：桥接进程不存在，自动启动");
+            StartBridgeBackground(false);
+            return;
+        }
+
+        if (status.HasRecentError || (lastStartAttemptUtc != DateTime.MinValue && (DateTime.UtcNow - lastStartAttemptUtc).TotalSeconds > 180))
+        {
+            lastRepairAttemptUtc = DateTime.UtcNow;
+            WriteLog("健康检查：桥接未 READY 或出现错误，自动重启");
+            StopBridgeInternal(false);
+            StartBridgeBackground(false);
+            return;
+        }
+
+        if (status.IsStale)
+        {
+            lastRepairAttemptUtc = DateTime.UtcNow;
+            WriteLog("健康检查：状态文件超过 " + status.AgeSeconds + " 秒未刷新，自动重启");
+            StopBridgeInternal(false);
+            StartBridgeBackground(false);
         }
     }
 
@@ -364,6 +501,16 @@ internal sealed class TrayContext : ApplicationContext
 
     private void StopBridge()
     {
+        StopBridgeInternal(true);
+    }
+
+    private void StopBridgeInternal(bool userRequested)
+    {
+        if (userRequested)
+        {
+            bridgeShouldRun = false;
+            autoStartTimer.Stop();
+        }
         var processes = GetBridgeProcesses()
             .OrderByDescending(p => p.IsSupervisor)
             .ThenBy(p => p.ProcessId)
@@ -385,7 +532,8 @@ internal sealed class TrayContext : ApplicationContext
     private void RestartBridge()
     {
         WriteLog("重启请求");
-        StopBridge();
+        bridgeShouldRun = true;
+        StopBridgeInternal(false);
         System.Threading.Thread.Sleep(1500);
         StartBridgeBackground(true);
     }
@@ -561,6 +709,7 @@ internal sealed class TrayContext : ApplicationContext
         script.Append("$codexOk=$false; if (Test-Path -LiteralPath $codexCommand) { $codexOk=$true } else { $cmd=Get-Command $codexCommand -ErrorAction SilentlyContinue; if ($cmd) { $codexOk=$true } } ");
         script.Append("if (-not $codexOk -and $codexCommand -eq 'codex') { if (Get-Command 'codex.cmd' -ErrorAction SilentlyContinue) { $codexOk=$true } elseif (Get-Command 'codex.exe' -ErrorAction SilentlyContinue) { $codexOk=$true } } ");
         script.Append("if (-not $codexOk) { FailEnv ('未找到 Codex CLI: ' + $codexCommand) } ");
+        script.Append("$health = & $exe @baseArgs .\\qq_gateway_client.py --check-qq-ready --timeout 8 2>&1; if ($LASTEXITCODE -ne 0) { WriteResult ('START_FAILED: ' + ($health -join ' ')); exit 30 } ");
         script.Append("Start-Process -FilePath $exe -ArgumentList ($baseArgs + @('-B',").Append(SingleQuote(backgroundScript)).Append(")) -WorkingDirectory ").Append(SingleQuote(clientDir)).Append(" -WindowStyle Hidden; ");
         script.Append("WriteResult 'STARTED'; ");
         script.Append("exit 0");
@@ -608,6 +757,8 @@ internal sealed class TrayContext : ApplicationContext
         notifyIcon.Dispose();
         runningIcon.Dispose();
         stoppedIcon.Dispose();
+        warningIcon.Dispose();
+        healthTimer.Stop();
         Application.Exit();
     }
 
@@ -623,11 +774,136 @@ internal sealed class TrayContext : ApplicationContext
         }
     }
 
+    private BridgeLogStatus ReadBridgeLogStatus()
+    {
+        BridgeLogStatus statusFromFile = ReadGatewayStatusFile();
+        if (statusFromFile.HasStatusFile)
+        {
+            return statusFromFile;
+        }
+
+        var status = new BridgeLogStatus();
+        try
+        {
+            if (!File.Exists(logFile))
+            {
+                return status;
+            }
+
+            string[] lines = File.ReadAllLines(logFile, Encoding.UTF8);
+            int start = Math.Max(0, lines.Length - 200);
+            for (int i = start; i < lines.Length; i++)
+            {
+                string line = lines[i] ?? "";
+            if (line.Contains("[gateway] READY") || line.Contains("[gateway] RESUMED") || line.Contains("[heartbeat]"))
+            {
+                status.IsReady = true;
+                status.HasRecentError = false;
+            }
+            else if (line.Contains("[gateway-loop-error]") || line.Contains("[gateway-error]") || line.Contains("config error:") || line.Contains("[health-error]"))
+            {
+                if (!line.Contains("Connection to remote host was lost."))
+                {
+                    status.HasRecentError = true;
+                    status.IsReady = false;
+                }
+            }
+            }
+        }
+        catch (Exception ex)
+        {
+            WriteLog("读取在线状态失败：" + ex.Message);
+        }
+        return status;
+    }
+
+    private void LogStatusSnapshot(bool running, BridgeLogStatus status, bool online, bool failed)
+    {
+        string snapshot =
+            "running=" + running +
+            " online=" + online +
+            " failed=" + failed +
+            " hasStatusFile=" + status.HasStatusFile +
+            " ready=" + status.IsReady +
+            " stale=" + status.IsStale +
+            " age=" + status.AgeSeconds +
+            " state=" + (status.State ?? "") +
+            " detail=" + (status.Detail ?? "");
+        if (snapshot == lastStatusSnapshot)
+        {
+            return;
+        }
+
+        lastStatusSnapshot = snapshot;
+        WriteLog("状态刷新：" + snapshot);
+    }
+
+    private BridgeLogStatus ReadGatewayStatusFile()
+    {
+        var status = new BridgeLogStatus();
+        try
+        {
+            if (!File.Exists(statusFile))
+            {
+                return status;
+            }
+
+            string text = File.ReadAllText(statusFile, Encoding.UTF8);
+            status.HasStatusFile = true;
+            status.Detail = ExtractJsonString(text, "detail");
+            string readyText = ExtractJsonRawValue(text, "ready");
+            double updatedAt = ExtractJsonDouble(text, "updated_at");
+            double ageSeconds = updatedAt > 0 ? Math.Abs(DateTimeOffset.UtcNow.ToUnixTimeSeconds() - updatedAt) : 0;
+            bool fresh = updatedAt <= 0 || ageSeconds <= 180;
+            bool ready = string.Equals(readyText, "true", StringComparison.OrdinalIgnoreCase);
+            string state = ExtractJsonString(text, "status").ToLowerInvariant();
+
+            status.State = state;
+            status.AgeSeconds = (int)Math.Round(ageSeconds);
+            status.IsStale = updatedAt > 0 && !fresh;
+            status.IsReady = fresh && ready;
+            status.HasRecentError = fresh && (state.Contains("error") || state.Contains("closed")) && !ready;
+        }
+        catch (Exception ex)
+        {
+            WriteLog("读取状态文件失败：" + ex.Message);
+        }
+        return status;
+    }
+
+    private static string ExtractJsonString(string json, string key)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(json, "\"" + System.Text.RegularExpressions.Regex.Escape(key) + "\"\\s*:\\s*\"((?:\\\\.|[^\"])*)\"");
+        if (!match.Success)
+        {
+            return "";
+        }
+        return match.Groups[1].Value.Replace("\\\"", "\"").Replace("\\\\", "\\");
+    }
+
+    private static string ExtractJsonRawValue(string json, string key)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(json, "\"" + System.Text.RegularExpressions.Regex.Escape(key) + "\"\\s*:\\s*([^,}\\r\\n]+)");
+        return match.Success ? match.Groups[1].Value.Trim() : "";
+    }
+
+    private static double ExtractJsonDouble(string json, string key)
+    {
+        double value;
+        string raw = ExtractJsonRawValue(json, key);
+        return double.TryParse(raw, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out value) ? value : 0;
+    }
+
     private static Icon CreateStatusIcon(bool running)
+    {
+        return CreateStatusIcon(running ? Color.FromArgb(37, 170, 84) : Color.FromArgb(190, 60, 50));
+    }
+
+    private static Icon CreateStatusIcon(Color color)
     {
         using (var bitmap = new Bitmap(16, 16))
         using (Graphics graphics = Graphics.FromImage(bitmap))
-        using (var brush = new SolidBrush(running ? Color.FromArgb(37, 170, 84) : Color.FromArgb(190, 60, 50)))
+        using (var brush = new SolidBrush(color))
         using (var pen = new Pen(Color.White, 1))
         {
             graphics.Clear(Color.Transparent);
@@ -653,6 +929,17 @@ internal sealed class TrayContext : ApplicationContext
         public int ProcessId;
         public string CommandLine;
         public bool IsSupervisor;
+    }
+
+    private sealed class BridgeLogStatus
+    {
+        public bool HasStatusFile;
+        public bool IsReady;
+        public bool HasRecentError;
+        public bool IsStale;
+        public int AgeSeconds;
+        public string State;
+        public string Detail;
     }
 
 }
