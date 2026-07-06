@@ -1461,6 +1461,15 @@ def archived_native_session_ids() -> set[str]:
     return {session_id for session_id in session_ids if session_id}
 
 
+def native_session_index_items() -> Dict[str, Dict[str, Any]]:
+    items: Dict[str, Dict[str, Any]] = {}
+    for item in parse_jsonl_file(CODEX_SESSION_INDEX):
+        session_id = str(item.get("id", "")).strip()
+        if session_id:
+            items[session_id] = item
+    return items
+
+
 def list_native_threads_from_db() -> Dict[str, Dict[str, Any]]:
     threads: Dict[str, Dict[str, Any]] = {}
     if not CODEX_STATE_DB.exists():
@@ -1516,11 +1525,26 @@ def list_native_threads_from_db() -> Dict[str, Dict[str, Any]]:
 def list_native_sessions(limit: int = 20, include_unlisted: bool = False) -> List[Dict[str, Any]]:
     db_threads = list_native_threads_from_db()
     if db_threads:
+        indexed = native_session_index_items()
         sessions = []
         for item in db_threads.values():
             if bool(item.get("archived")):
                 continue
             sid = str(item.get("id", ""))
+            index_item = indexed.get(sid) or {}
+            indexed_title = str(index_item.get("thread_name") or "").strip()
+            if indexed_title:
+                item = {
+                    **item,
+                    "thread_name": indexed_title,
+                    "index_thread_name": indexed_title,
+                }
+            indexed_updated_at = str(index_item.get("updated_at") or "").strip()
+            if indexed_updated_at:
+                item = {
+                    **item,
+                    "index_updated_at": indexed_updated_at,
+                }
             if not include_unlisted:
                 title = session_title(item, sid)
                 if not is_meaningful_resume_title(title, sid):
@@ -1543,6 +1567,8 @@ def list_native_sessions(limit: int = 20, include_unlisted: bool = False) -> Lis
         merged[session_id] = {
             **existing,
             **item,
+            "index_thread_name": str(item.get("thread_name") or "").strip(),
+            "index_updated_at": str(item.get("updated_at") or "").strip(),
             "path": existing.get("path", ""),
             "size": existing.get("size", 0),
         }
@@ -2097,14 +2123,46 @@ def help_text() -> str:
 
 def start_text() -> str:
     runtime = current_runtime()
+    current_directory = ""
+    current_title = ""
+    if runtime["context_mode"] == "native":
+        session_id = str(runtime.get("active_native_session_id") or "").strip()
+        if session_id:
+            item = find_native_session(session_id)
+            if item:
+                current_directory = native_session_group_label(str(item.get("cwd", "")))
+                title = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", session_title(item, session_id))
+                title = re.sub(r"^\[([^\]]+)\](?:\([^)]*)?", r"\1", title)
+                title = re.sub(r"\s+", " ", title).strip()
+                if len(title) > 40:
+                    title = title[:39] + "…"
+                current_title = title
+            else:
+                current_directory = "未知目录"
+                current_title = session_id[-6:]
+        else:
+            current_directory = "未选择 Codex 会话"
+            current_title = "-"
+    else:
+        state = load_state()
+        session_id = str(state.get("active_session_id", "")).strip()
+        item = (state.get("sessions") or {}).get(session_id, {}) if session_id else {}
+        title = re.sub(r"\s+", " ", str(item.get("title", "本地会话"))).strip()
+        if len(title) > 40:
+            title = title[:39] + "…"
+        current_directory = "本地"
+        current_title = title
     return "\n".join([
         "Codex Remote Bridge 已启动",
         "我是你的远程 Codex 助手，可以通过 QQ 帮你查看和切换 Codex 会话、继续对话、调整模型、查看状态，并把需要审批的操作发回给你确认。",
+        f"当前目录：{current_directory}",
+        f"当前对话：{current_title}",
         f"model: {runtime['model']}",
         f"reasoning: {runtime['reasoning_effort']}",
         "",
         "点击按钮或发送命令开始使用：",
         "/resume - Codex 会话列表",
+        "/recent - 查看最近对话记录",
         "/model - 模型设置",
         "/ci <内容> - 强制发送给 Codex",
         "/whoami - 用户信息",

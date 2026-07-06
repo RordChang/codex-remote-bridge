@@ -681,10 +681,41 @@ def short_cwd_label(cwd: str) -> str:
 
 def clean_card_title(text: str, fallback: str) -> str:
     title = re.sub(r"\s+", " ", (text or "").strip())
+    title = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", title)
+    title = re.sub(r"^\[([^\]]+)\](?:\([^)]*)?", r"\1", title)
     if not title or title.lower() in {"codex", "codex cli", "codex desktop", "codex desktop app"}:
         return fallback
     title = re.sub(r"^#*\s*", "", title).strip()
     return title or fallback
+
+
+def current_session_parts(runtime: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    runtime = runtime or current_runtime()
+    if runtime["context_mode"] == "native":
+        session_id = str(runtime.get("active_native_session_id") or "").strip()
+        if not session_id:
+            return {"directory": "未选择 Codex 会话", "title": "-"}
+        item = next(
+            (entry for entry in list_native_sessions(limit=10000, include_unlisted=True)
+             if str(entry.get("id", "")) == session_id),
+            None,
+        )
+        if item is None:
+            return {"directory": "未知目录", "title": f"#{short_id(session_id)}"}
+        directory = short_cwd_label(str(item.get("cwd", "")))
+        title = shorten_label(clean_card_title(session_title(item, session_id), "未命名"), 32)
+        return {"directory": directory, "title": title}
+
+    state = load_state()
+    session_id = str(state.get("active_session_id", "")).strip()
+    item = (state.get("sessions") or {}).get(session_id, {}) if session_id else {}
+    title = shorten_label(clean_card_title(str(item.get("title", "")), "本地会话"), 32)
+    return {"directory": "本地", "title": title}
+
+
+def current_session_display(runtime: Optional[Dict[str, Any]] = None) -> str:
+    parts = current_session_parts(runtime)
+    return f"{parts['directory']} / {parts['title']}"
 
 
 def chunked(items: List[Any], size: int) -> List[List[Any]]:
@@ -902,16 +933,18 @@ def build_model_card() -> Dict[str, Any]:
 
 def build_start_card() -> Dict[str, Any]:
     runtime = current_runtime()
+    session_parts = current_session_parts(runtime)
     rows = [
         {
             "buttons": [
                 keyboard_button("Codex会话列表", "/resume", button_id="start-resume", style=1),
+                keyboard_button("最近对话记录", "/recent", button_id="start-recent", style=1),
                 keyboard_button("模型设置", "/model", button_id="start-model", style=1),
-                keyboard_button("设置", "/setup", button_id="start-setup", style=0),
             ]
         },
         {
             "buttons": [
+                keyboard_button("设置", "/setup", button_id="start-setup", style=0),
                 keyboard_button("用户信息", "/whoami", button_id="start-whoami", style=0),
                 keyboard_button("状态", "/status", button_id="start-status", style=0),
                 keyboard_button("帮助", "/help", button_id="start-help", style=0),
@@ -922,6 +955,8 @@ def build_start_card() -> Dict[str, Any]:
         "markdown": "\n".join([
             "Codex Remote Bridge",
             "我是你的远程 Codex 助手，可以通过 QQ 帮你查看和切换 Codex 会话、继续对话、调整模型、查看状态，并把需要审批的操作发回给你确认。",
+            f"当前目录：{session_parts['directory']}",
+            f"当前对话：{session_parts['title']}",
             f"model: {runtime['model']}",
             f"reasoning: {runtime['reasoning_effort']}",
             "点击按钮开始使用。",
@@ -2285,6 +2320,7 @@ class QQGatewayClient:
         self.connection_started_at = 0.0
         self.last_gateway_message_at = 0.0
         self.last_heartbeat_ack_at = 0.0
+        self.expected_reconnect = False
 
     def write_status(self, status: str, detail: str = "", session_id: str = "", ready: bool = False) -> None:
         if self.update_status:
@@ -2299,6 +2335,7 @@ class QQGatewayClient:
         self.write_status("connecting", "connecting to QQ Gateway", ready=False)
         now = time.time()
         self.ready = False
+        self.expected_reconnect = False
         self.connection_started_at = now
         self.last_gateway_message_at = now
         self.last_heartbeat_ack_at = now
@@ -2434,12 +2471,14 @@ class QQGatewayClient:
 
             if op == 7:
                 print("[gateway] server requested reconnect", flush=True)
+                self.expected_reconnect = True
                 self.write_status("reconnecting", "server requested reconnect", self.session_id, ready=False)
                 self.close()
                 return
 
             if op == 9:
                 print("[gateway] invalid session; reconnecting with identify", flush=True)
+                self.expected_reconnect = True
                 self.write_status("reconnecting", "invalid session", "", ready=False)
                 self.session_id = ""
                 self.latest_seq = None
@@ -2566,7 +2605,10 @@ class QQGatewayClient:
         self.stop_heartbeat()
         self.stop_health_monitor()
         self.ready = False
-        self.write_status("closed", f"code={code} reason={reason}", self.session_id, ready=False)
+        if self.expected_reconnect:
+            self.write_status("reconnecting", f"closed for reconnect code={code} reason={reason}", self.session_id, ready=False)
+        else:
+            self.write_status("closed", f"code={code} reason={reason}", self.session_id, ready=False)
         print(f"[gateway] closed code={code} reason={reason}", flush=True)
 
     def close(self) -> None:

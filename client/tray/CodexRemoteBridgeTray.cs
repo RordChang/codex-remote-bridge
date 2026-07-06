@@ -36,6 +36,7 @@ internal sealed class TrayContext : ApplicationContext
 {
     private const string TaskName = "CodexRemoteBridgeTray";
     private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    private const int ReconnectGraceSeconds = 300;
 
     private readonly string exePath;
     private readonly string clientDir;
@@ -148,7 +149,7 @@ internal sealed class TrayContext : ApplicationContext
         bool running = GetBridgeProcesses().Any();
         BridgeLogStatus logStatus = ReadBridgeLogStatus();
         bool online = running && logStatus.IsReady;
-        bool failed = running && (logStatus.HasRecentError || logStatus.IsStale) && !logStatus.IsReady;
+        bool failed = running && !logStatus.IsTransientReconnect && (logStatus.HasRecentError || logStatus.IsStale) && !logStatus.IsReady;
         statusItem.Text = online ? "状态：已在线" : (failed ? "状态：异常，请查看日志" : (running ? "状态：连接中" : "状态：未运行"));
         autostartItem.Text = IsAutostartConfigured() ? "开机自启动：已开启" : "开机自启动：未开启";
         notifyIcon.Text = online ? "Codex Remote Bridge：已在线" : (failed ? "Codex Remote Bridge：异常" : (running ? "Codex Remote Bridge：连接中" : "Codex Remote Bridge：未运行"));
@@ -456,6 +457,21 @@ internal sealed class TrayContext : ApplicationContext
         {
             lastRepairAttemptUtc = DateTime.UtcNow;
             WriteLog("健康检查：桥接进程不存在，自动启动");
+            StartBridgeBackground(false);
+            return;
+        }
+
+        if (status.IsTransientReconnect)
+        {
+            if (status.AgeSeconds <= ReconnectGraceSeconds)
+            {
+                WriteLog("健康检查：桥接正在自动重连，已等待 " + status.AgeSeconds + " 秒");
+                return;
+            }
+
+            lastRepairAttemptUtc = DateTime.UtcNow;
+            WriteLog("健康检查：自动重连超过 " + status.AgeSeconds + " 秒未恢复，自动重启");
+            StopBridgeInternal(false);
             StartBridgeBackground(false);
             return;
         }
@@ -825,6 +841,7 @@ internal sealed class TrayContext : ApplicationContext
             " failed=" + failed +
             " hasStatusFile=" + status.HasStatusFile +
             " ready=" + status.IsReady +
+            " reconnecting=" + status.IsTransientReconnect +
             " stale=" + status.IsStale +
             " age=" + status.AgeSeconds +
             " state=" + (status.State ?? "") +
@@ -862,7 +879,8 @@ internal sealed class TrayContext : ApplicationContext
             status.AgeSeconds = (int)Math.Round(ageSeconds);
             status.IsStale = updatedAt > 0 && !fresh;
             status.IsReady = fresh && ready;
-            status.HasRecentError = fresh && (state.Contains("error") || state.Contains("closed")) && !ready;
+            status.IsTransientReconnect = !ready && (state.Contains("reconnecting") || state.Contains("connecting") || state.Contains("hello") || state.Contains("closed"));
+            status.HasRecentError = fresh && (state.Contains("error") || state.Contains("config_error")) && !ready;
         }
         catch (Exception ex)
         {
@@ -936,6 +954,7 @@ internal sealed class TrayContext : ApplicationContext
         public bool HasStatusFile;
         public bool IsReady;
         public bool HasRecentError;
+        public bool IsTransientReconnect;
         public bool IsStale;
         public int AgeSeconds;
         public string State;
