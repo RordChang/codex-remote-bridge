@@ -42,9 +42,9 @@ def write_json_atomic(path: Path, data: Dict[str, Any], lock: threading.RLock) -
     )
     with lock:
         try:
-            tmp.write_text(payload, encoding="utf-8")
             for attempt in range(8):
                 try:
+                    tmp.write_text(payload, encoding="utf-8")
                     tmp.replace(path)
                     return
                 except PermissionError:
@@ -81,9 +81,21 @@ def env_bool(name: str, default: bool) -> bool:
 
 load_dotenv(BASE_DIR / ".env")
 
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+DEFAULT_CODEX_REASONING_EFFORT = "medium"
+DEFAULT_ALLOWED_MODELS = (
+    "gpt-5.6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.5",
+)
+REMOVED_MODELS = {"gpt-5.4"}
+
 CODEX_COMMAND = os.getenv("CODEX_COMMAND", "codex")
-CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.5").strip() or "gpt-5.5"
-CODEX_REASONING_EFFORT = os.getenv("CODEX_REASONING_EFFORT", "xhigh").strip() or "xhigh"
+CODEX_REASONING_EFFORT = (
+    os.getenv("CODEX_REASONING_EFFORT", DEFAULT_CODEX_REASONING_EFFORT).strip()
+    or DEFAULT_CODEX_REASONING_EFFORT
+)
 CODEX_PERMISSION = os.getenv("CODEX_PERMISSION", "read-only").strip() or "read-only"
 CODEX_CONTEXT_MODE = os.getenv("CODEX_CONTEXT_MODE", "native").strip().lower() or "native"
 QQ_OWNER_QQ = os.getenv("QQ_OWNER_QQ", "").strip()
@@ -93,11 +105,22 @@ RECENT_DEFAULT_COUNT = max(1, min(20, int(os.getenv("RECENT_DEFAULT_COUNT", "5")
 TASK_STATUS_INTERVAL_SECONDS = max(0, int(os.getenv("QQ_TASK_STATUS_INTERVAL_SECONDS", "300")))
 TRUNCATE_LONG_REPLIES = env_bool("QQ_TRUNCATE_LONG_REPLIES", True)
 
-ALLOWED_MODELS = [
+_configured_models = [
     item.strip()
-    for item in os.getenv("CODEX_ALLOWED_MODELS", "gpt-5.5,gpt-5.4").split(",")
+    for item in os.getenv("CODEX_ALLOWED_MODELS", ",".join(DEFAULT_ALLOWED_MODELS)).split(",")
     if item.strip()
 ]
+if set(_configured_models) == {"gpt-5.5", "gpt-5.4"}:
+    _configured_models = list(DEFAULT_ALLOWED_MODELS)
+ALLOWED_MODELS = list(dict.fromkeys(
+    item for item in _configured_models if item not in REMOVED_MODELS
+)) or list(DEFAULT_ALLOWED_MODELS)
+_configured_model = os.getenv("CODEX_MODEL", DEFAULT_CODEX_MODEL).strip() or DEFAULT_CODEX_MODEL
+CODEX_MODEL = (
+    _configured_model
+    if _configured_model in ALLOWED_MODELS
+    else DEFAULT_CODEX_MODEL if DEFAULT_CODEX_MODEL in ALLOWED_MODELS else ALLOWED_MODELS[0]
+)
 
 current_codex_lock = threading.Lock()
 current_codex_proc: Optional[subprocess.Popen] = None
@@ -330,18 +353,29 @@ def normalize_reasoning(value: str) -> str:
 
 def normalize_model(value: str) -> str:
     value = value.strip().lower()
-    compact = re.sub(r"[\s_-]+", "", value)
-    if compact in {"gpt55", "gpt5.5"}:
-        model = "gpt-5.5"
-    elif compact in {"gpt54", "gpt5.4"}:
-        model = "gpt-5.4"
-    else:
-        model = re.sub(r"\s+", "-", value)
-        if model.startswith("gpt") and not model.startswith("gpt-"):
-            model = "gpt-" + model[3:]
+    compact = re.sub(r"[\s_.-]+", "", value)
+    aliases = {
+        "luna": "gpt-5.6-luna",
+        "gpt56luna": "gpt-5.6-luna",
+        "sol": "gpt-5.6-sol",
+        "gpt56sol": "gpt-5.6-sol",
+        "terra": "gpt-5.6-terra",
+        "gpt56terra": "gpt-5.6-terra",
+        "gpt55": "gpt-5.5",
+    }
+    model = aliases.get(compact, re.sub(r"\s+", "-", value))
+    if model.startswith("gpt") and not model.startswith("gpt-"):
+        model = "gpt-" + model[3:]
     if model not in ALLOWED_MODELS:
         raise ValueError("unsupported model")
     return model
+
+
+def normalize_runtime_model(value: str) -> str:
+    value = value.strip().lower()
+    if value in REMOVED_MODELS:
+        return DEFAULT_CODEX_MODEL
+    return normalize_model(value)
 
 
 def load_state() -> Dict[str, Any]:
@@ -382,6 +416,27 @@ def load_state() -> Dict[str, Any]:
         normalized_permission = defaults["permission"]
     if state.get("permission") != normalized_permission:
         state["permission"] = normalized_permission
+        changed = True
+    previous_model = str(state.get("model", defaults["model"]))
+    try:
+        normalized_model = normalize_model(previous_model)
+    except ValueError:
+        normalized_model = (
+            DEFAULT_CODEX_MODEL if DEFAULT_CODEX_MODEL in ALLOWED_MODELS else CODEX_MODEL
+        )
+    if state.get("model") != normalized_model:
+        state["model"] = normalized_model
+        changed = True
+        if previous_model in REMOVED_MODELS:
+            state["reasoning_effort"] = DEFAULT_CODEX_REASONING_EFFORT
+    try:
+        normalized_reasoning = normalize_reasoning(
+            str(state.get("reasoning_effort", defaults["reasoning_effort"]))
+        )
+    except ValueError:
+        normalized_reasoning = defaults["reasoning_effort"]
+    if state.get("reasoning_effort") != normalized_reasoning:
+        state["reasoning_effort"] = normalized_reasoning
         changed = True
     if int(state.get("timeout_seconds", 0) or 0) == 900 and CODEX_TIMEOUT_SECONDS > 900:
         state["timeout_seconds"] = CODEX_TIMEOUT_SECONDS
@@ -557,7 +612,14 @@ def runtime_for_job(job: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         runtime["permission"] = permission
         runtime["permission_profile"] = PERMISSION_PROFILES[permission]
         runtime["context_mode"] = normalize_context_mode(str(runtime.get("context_mode", CODEX_CONTEXT_MODE)))
-        runtime["reasoning_effort"] = normalize_reasoning(str(runtime.get("reasoning_effort", CODEX_REASONING_EFFORT)))
+        runtime["active_native_session_id"] = primary_native_session_id(str(runtime.get("active_native_session_id", "")))
+        queued_model = str(runtime.get("model", CODEX_MODEL)).strip().lower()
+        runtime["model"] = normalize_runtime_model(queued_model)
+        runtime["reasoning_effort"] = (
+            DEFAULT_CODEX_REASONING_EFFORT
+            if queued_model in REMOVED_MODELS
+            else normalize_reasoning(str(runtime.get("reasoning_effort", CODEX_REASONING_EFFORT)))
+        )
         runtime["workdir"] = normalize_cwd(runtime.get("workdir", "")) or default_process_cwd()
         runtime["timeout_seconds"] = int(runtime.get("timeout_seconds", CODEX_TIMEOUT_SECONDS) or CODEX_TIMEOUT_SECONDS)
         runtime["recent_default_count"] = clamp_int(int(runtime.get("recent_default_count", RECENT_DEFAULT_COUNT) or RECENT_DEFAULT_COUNT), 1, 20)
@@ -859,8 +921,13 @@ def run_approved_pending_approval(item: Dict[str, Any]) -> str:
     runtime["context_mode"] = normalize_context_mode(str(item.get("context_mode", runtime["context_mode"])))
     runtime["active_native_session_id"] = str(item.get("native_session_id", runtime["active_native_session_id"]))
     runtime["active_session_id"] = str(item.get("local_session_id", runtime["active_session_id"]))
-    runtime["model"] = str(item.get("model", runtime["model"]))
-    runtime["reasoning_effort"] = normalize_reasoning(str(item.get("reasoning_effort", runtime["reasoning_effort"])))
+    pending_model = str(item.get("model", runtime["model"])).strip().lower()
+    runtime["model"] = normalize_runtime_model(pending_model)
+    runtime["reasoning_effort"] = (
+        DEFAULT_CODEX_REASONING_EFFORT
+        if pending_model in REMOVED_MODELS
+        else normalize_reasoning(str(item.get("reasoning_effort", runtime["reasoning_effort"])))
+    )
     runtime["permission"] = normalize_permission(str(item.get("permission", runtime["permission"])))
     runtime["permission_profile"] = PERMISSION_PROFILES[runtime["permission"]]
     runtime["workdir"] = normalize_cwd(item.get("workdir", runtime.get("workdir", ""))) or runtime["workdir"]
@@ -888,6 +955,7 @@ def run_approved_pending_approval(item: Dict[str, Any]) -> str:
 def current_runtime() -> Dict[str, Any]:
     state = load_state()
     permission = normalize_permission(str(state.get("permission", "read-only")))
+    active_native_session_id = primary_native_session_id(str(state.get("active_native_session_id", "")))
     return {
         "context_mode": normalize_context_mode(str(state.get("context_mode", CODEX_CONTEXT_MODE))),
         "model": str(state.get("model", CODEX_MODEL)),
@@ -895,7 +963,7 @@ def current_runtime() -> Dict[str, Any]:
         "permission": permission,
         "permission_profile": PERMISSION_PROFILES[permission],
         "active_session_id": str(state.get("active_session_id", "")),
-        "active_native_session_id": str(state.get("active_native_session_id", "")),
+        "active_native_session_id": active_native_session_id,
         "timeout_seconds": int(state.get("timeout_seconds", CODEX_TIMEOUT_SECONDS) or CODEX_TIMEOUT_SECONDS),
         "recent_default_count": clamp_int(int(state.get("recent_default_count", RECENT_DEFAULT_COUNT) or RECENT_DEFAULT_COUNT), 1, 20),
         "task_status_interval_seconds": clamp_int(int(state.get("task_status_interval_seconds", TASK_STATUS_INTERVAL_SECONDS) or 0), 0, 86400),
@@ -950,7 +1018,7 @@ def parse_jsonl_file(path: Path) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
     items = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -991,9 +1059,22 @@ def read_session_meta(path: Path) -> Optional[Dict[str, Any]]:
         "cwd": str(payload.get("cwd", "")),
         "originator": str(payload.get("originator", "")),
         "source": str(payload.get("source", "")),
+        "parent_thread_id": str(payload.get("parent_thread_id", "")),
         "path": str(path),
         "size": path.stat().st_size,
     }
+
+
+def read_session_parent_thread_id(path_str: str) -> str:
+    if not path_str:
+        return ""
+    path = Path(path_str)
+    if not path.exists():
+        return ""
+    meta = read_session_meta(path)
+    if not meta:
+        return ""
+    return str(meta.get("parent_thread_id") or "").strip()
 
 
 GENERIC_NATIVE_TITLES = {
@@ -1294,6 +1375,23 @@ def is_meaningful_resume_title(title: str, fallback_id: str = "") -> bool:
 
 
 def session_title(item: Dict[str, Any], fallback_id: str) -> str:
+    return _session_title(item, fallback_id, set())
+
+
+def _session_title(item: Dict[str, Any], fallback_id: str, seen: set[str]) -> str:
+    item_id = str(item.get("id") or "").strip()
+    if item_id:
+        if item_id in seen:
+            return fallback_id[-8:] if fallback_id else "未命名"
+        seen.add(item_id)
+
+    parent_item = parent_native_session(item)
+    if parent_item:
+        parent_title = _session_title(parent_item, str(parent_item.get("id", "")), seen)
+        if parent_title:
+            parent_title = re.sub(r"(?:（子任务）)+$", "", parent_title).strip()
+            return f"{parent_title}（子任务）"
+
     title = _clean_thread_text_title(item.get("thread_name") or item.get("title"))
     if not title:
         title = _clean_thread_text_title(item.get("first_user_message") or item.get("preview"))
@@ -1308,6 +1406,53 @@ def session_title(item: Dict[str, Any], fallback_id: str) -> str:
         title = fallback_id[-8:] if fallback_id else "未命名"
     title = re.sub(r"\s+", " ", title).strip()
     return title
+
+
+def is_derived_native_session(item: Dict[str, Any]) -> bool:
+    source = str(item.get("source") or "").strip()
+    originator = str(item.get("originator") or "").strip()
+    thread_source = str(item.get("thread_source") or "").strip()
+    return (
+        thread_source == "subagent"
+        or source == "subagent"
+        or "subagent" in source
+        or "subagent" in originator
+        or "guardian" in source
+        or "guardian" in originator
+    )
+
+
+def parent_native_session(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not is_derived_native_session(item):
+        return None
+    parent_id = str(item.get("parent_thread_id") or "").strip()
+    current_id = str(item.get("id") or "").strip()
+    if not parent_id or parent_id == current_id:
+        return None
+    parent_item = find_native_session(parent_id)
+    if not parent_item:
+        return None
+    if str(parent_item.get("id") or "").strip() == current_id:
+        return None
+    return parent_item
+
+
+def primary_native_session_id(session_id: str) -> str:
+    session_id = (session_id or "").strip()
+    if not session_id:
+        return ""
+    seen: set[str] = set()
+    current_id = session_id
+    while current_id and current_id not in seen:
+        seen.add(current_id)
+        item = find_native_session(current_id)
+        if not item:
+            return current_id
+        parent_id = str(item.get("parent_thread_id") or "").strip()
+        if not is_derived_native_session(item) or not parent_id:
+            return current_id
+        current_id = parent_id
+    return current_id or session_id
 
 
 def native_session_group_label(cwd: str) -> str:
@@ -1345,7 +1490,7 @@ def resolve_native_session_id(query: str, limit: int = 10000) -> str:
         return ""
 
     matches: List[str] = []
-    for item in list_native_sessions(limit=limit):
+    for item in list_native_sessions(limit=limit, include_unlisted=True):
         session_id = str(item.get("id", ""))
         if session_id == query:
             return session_id
@@ -1501,6 +1646,8 @@ def list_native_threads_from_db() -> Dict[str, Dict[str, Any]]:
         updated_raw = int(row["updated_at_ms"] or row["updated_at"] or 0)
         created_raw = int(row["created_at_ms"] or row["created_at"] or 0)
         path = str(row["rollout_path"] or "").strip()
+        source = str(row["source"] or "").strip()
+        thread_source = str(row["thread_source"] or "").strip()
         threads[session_id] = {
             "id": session_id,
             "thread_name": str(row["title"] or "").strip(),
@@ -1512,8 +1659,10 @@ def list_native_threads_from_db() -> Dict[str, Dict[str, Any]]:
             "created_at": unix_time_to_iso(created_raw),
             "created_at_raw": created_raw,
             "cwd": normalize_cwd(row["cwd"]),
-            "originator": str(row["source"] or "").strip(),
-            "source": str(row["thread_source"] or row["source"] or "").strip(),
+            "originator": source,
+            "source": thread_source or source,
+            "thread_source": thread_source,
+            "parent_thread_id": read_session_parent_thread_id(path),
             "path": path,
             "size": Path(path).stat().st_size if path and Path(path).exists() else 0,
             "archived": bool(row["archived"]),
@@ -1529,6 +1678,8 @@ def list_native_sessions(limit: int = 20, include_unlisted: bool = False) -> Lis
         sessions = []
         for item in db_threads.values():
             if bool(item.get("archived")):
+                continue
+            if not include_unlisted and is_derived_native_session(item):
                 continue
             sid = str(item.get("id", ""))
             index_item = indexed.get(sid) or {}
@@ -1575,6 +1726,8 @@ def list_native_sessions(limit: int = 20, include_unlisted: bool = False) -> Lis
     sessions = []
     for item in merged.values():
         if bool(item.get("archived")):
+            continue
+        if not include_unlisted and is_derived_native_session(item):
             continue
         sid = str(item.get("id", ""))
         if not include_unlisted:
@@ -2077,8 +2230,8 @@ def help_text() -> str:
         "/status - 显示 Gateway、模型、思考强度、历史长度、权限",
         "/whoami - 显示当前 QQ Gateway openid，用于配置 allowlist",
         "/model - 查看当前模型和思考强度",
-        "/model gpt-5.5 high - 切换模型和思考强度",
-        "/model gpt-5.4 xhigh - 支持 gpt-5.5 / gpt-5.4；思考强度 none/minimal/low/medium/high/xhigh",
+        "/model gpt-5.6-sol medium - 切换模型和思考强度",
+        "/model luna high - 支持 gpt-5.6-luna / sol / terra / gpt-5.5；思考强度 none/minimal/low/medium/high/xhigh",
         "/ci <内容> - 强制把后续内容发送给 Codex，适合转发 Codex/SkillKit slash 命令",
         "/codexInstruction <内容> - /ci 的完整写法",
         "/cancel - 取消当前正在运行的 Codex 任务",
@@ -2194,20 +2347,30 @@ def parse_model_command(args: str) -> str:
             f"当前模型：{state.get('model')}\n"
             f"当前思考强度：{state.get('reasoning_effort')}\n"
             f"可选模型：{', '.join(ALLOWED_MODELS)}\n"
-            "用法：/model gpt-5.5 high"
+            "用法：/model gpt-5.6-sol medium"
         )
 
     model = None
     reasoning = None
-    compact = re.sub(r"[\s_-]+", "", args.lower())
-    if "gpt55" in compact or "gpt5.5" in compact:
-        model = "gpt-5.5"
-    if "gpt54" in compact or "gpt5.4" in compact:
-        model = "gpt-5.4"
+    compact = re.sub(r"[\s_.-]+", "", args.lower())
+    for marker, candidate in (
+        ("gpt56luna", "gpt-5.6-luna"),
+        ("gpt56sol", "gpt-5.6-sol"),
+        ("gpt56terra", "gpt-5.6-terra"),
+        ("gpt55", "gpt-5.5"),
+    ):
+        if marker in compact and candidate in ALLOWED_MODELS:
+            model = candidate
+            break
 
     for token in re.split(r"[\s,，]+", args):
         if not token:
             continue
+        if model is None:
+            try:
+                model = normalize_model(token)
+            except ValueError:
+                pass
         try:
             reasoning = normalize_reasoning(token)
         except ValueError:
@@ -2220,7 +2383,7 @@ def parse_model_command(args: str) -> str:
             model = None
 
     if model is None and reasoning is None:
-        return "无法识别模型或思考强度。示例：/model gpt-5.5 high"
+        return "无法识别模型或思考强度。示例：/model gpt-5.6-sol medium"
 
     if model is not None:
         state["model"] = model
@@ -2343,10 +2506,16 @@ def resume_command(args: str) -> str:
             return "会话 id 格式不合法。"
         if not find_native_session(session_id):
             return "没有在 Codex session_index 中找到这个 id。\n\n" + session_list_text()
-        state["active_native_session_id"] = session_id
+        primary_session_id = primary_native_session_id(session_id)
+        state["active_native_session_id"] = primary_session_id
         state["context_mode"] = "native"
         save_state(state)
-        return f"已切换到 Codex 原生会话：{session_id}\n发送 /recent 查看最近对话内容。"
+        if primary_session_id != session_id:
+            return (
+                f"该 id 是派生子任务，已切换到它的主会话：{primary_session_id}\n"
+                "发送 /recent 查看最近对话内容。"
+            )
+        return f"已切换到 Codex 原生会话：{primary_session_id}\n发送 /recent 查看最近对话内容。"
 
     try:
         session_id = safe_local_session_id(session_id)

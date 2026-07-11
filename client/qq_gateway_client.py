@@ -22,6 +22,7 @@ except Exception:
     websocket = None
 
 from codex_bridge_client import (
+    ALLOWED_MODELS,
     append_history,
     approval_prompt_text,
     cancel_current_task,
@@ -887,23 +888,17 @@ def build_model_card() -> Dict[str, Any]:
     model = runtime["model"]
     reasoning = runtime["reasoning_effort"]
 
+    model_buttons = [
+        keyboard_button(
+            item,
+            f"/model {item}",
+            button_id=f"model-{item}",
+            style=1 if model == item else 0,
+        )
+        for item in ALLOWED_MODELS
+    ]
     rows = [
-        {
-            "buttons": [
-                keyboard_button(
-                    "gpt-5.5",
-                    "/model gpt-5.5",
-                    button_id="model-gpt-5.5",
-                    style=1 if model == "gpt-5.5" else 0,
-                ),
-                keyboard_button(
-                    "gpt-5.4",
-                    "/model gpt-5.4",
-                    button_id="model-gpt-5.4",
-                    style=1 if model == "gpt-5.4" else 0,
-                ),
-            ]
-        },
+        *({"buttons": buttons} for buttons in chunked(model_buttons, 2)),
         {
             "buttons": [
                 keyboard_button("low", "/model low", button_id="reason-low", style=1 if reasoning == "low" else 0),

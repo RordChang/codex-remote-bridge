@@ -156,8 +156,9 @@ QQ_APP_ID=replace-with-qq-app-id
 QQ_APP_SECRET=replace-with-qq-app-secret
 CODEX_COMMAND=codex
 CODEX_CONTEXT_MODE=native
-CODEX_MODEL=gpt-5.5
-CODEX_REASONING_EFFORT=xhigh
+CODEX_MODEL=gpt-5.6-sol
+CODEX_REASONING_EFFORT=medium
+CODEX_ALLOWED_MODELS=gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-5.5
 CODEX_PERMISSION=read-only
 ```
 
@@ -215,8 +216,8 @@ client/data/qq-gateway-autostart.log
 /status                       显示 Gateway、上下文、模型、思考强度、权限
 /whoami                       显示当前 QQ Gateway openid，用于配置 allowlist
 /model                        显示当前模型和思考强度
-/model gpt-5.5 high           设置模型和思考强度
-/model gpt-5.4 xhigh          设置模型和思考强度
+/model gpt-5.6-sol medium     设置模型和思考强度
+/model luna high              可使用 luna / sol / terra 简写
 /ci <内容>                    强制把后续内容发送给 Codex，适合转发 Codex/SkillKit slash 命令
 /codexInstruction <内容>      /ci 的完整写法，例如 /ci /wiki init xxx
 /setup                        显示设置面板
@@ -480,8 +481,9 @@ QQ_APP_ID=replace-with-qq-app-id
 QQ_APP_SECRET=replace-with-qq-app-secret
 CODEX_COMMAND=codex
 CODEX_CONTEXT_MODE=native
-CODEX_MODEL=gpt-5.5
-CODEX_REASONING_EFFORT=xhigh
+CODEX_MODEL=gpt-5.6-sol
+CODEX_REASONING_EFFORT=medium
+CODEX_ALLOWED_MODELS=gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-5.5
 CODEX_PERMISSION=read-only
 ```
 
@@ -539,8 +541,8 @@ Messages starting with `/` are handled locally by the bridge and are not sent to
 /status                       Show gateway, context, model, reasoning, permission
 /whoami                       Show current QQ Gateway openid for allowlist setup
 /model                        Show current model/reasoning
-/model gpt-5.5 high           Set model and reasoning
-/model gpt-5.4 xhigh          Set model and reasoning
+/model gpt-5.6-sol medium     Set model and reasoning
+/model luna high              luna / sol / terra aliases are supported
 /ci <text>                    Force-send following text to Codex; useful for Codex/SkillKit slash commands
 /codexInstruction <text>      Full form of /ci, for example /ci /wiki init xxx
 /setup                        Show settings panel

@@ -687,13 +687,24 @@ function Write-EnvFile {
         [string]$AppSecret
     )
 
+    $model = Get-EnvValue -Map $Existing -Key 'CODEX_MODEL' -DefaultValue 'gpt-5.6-sol'
+    $reasoning = Get-EnvValue -Map $Existing -Key 'CODEX_REASONING_EFFORT' -DefaultValue 'medium'
+    $allowedModels = Get-EnvValue -Map $Existing -Key 'CODEX_ALLOWED_MODELS' -DefaultValue 'gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-5.5'
+    if ($model -eq 'gpt-5.4') {
+        $model = 'gpt-5.6-sol'
+        $reasoning = 'medium'
+    }
+    if ($allowedModels -in @('gpt-5.5,gpt-5.4', 'gpt-5.4,gpt-5.5')) {
+        $allowedModels = 'gpt-5.6-luna,gpt-5.6-sol,gpt-5.6-terra,gpt-5.5'
+    }
+
     $lines = @(
         "CODEX_COMMAND=$CodexCommand",
-        "CODEX_MODEL=$(Get-EnvValue -Map $Existing -Key 'CODEX_MODEL' -DefaultValue 'gpt-5.5')",
-        "CODEX_REASONING_EFFORT=$(Get-EnvValue -Map $Existing -Key 'CODEX_REASONING_EFFORT' -DefaultValue 'xhigh')",
+        "CODEX_MODEL=$model",
+        "CODEX_REASONING_EFFORT=$reasoning",
         "CODEX_PERMISSION=$(Get-EnvValue -Map $Existing -Key 'CODEX_PERMISSION' -DefaultValue 'read-only')",
         "CODEX_CONTEXT_MODE=$(Get-EnvValue -Map $Existing -Key 'CODEX_CONTEXT_MODE' -DefaultValue 'native')",
-        "CODEX_ALLOWED_MODELS=$(Get-EnvValue -Map $Existing -Key 'CODEX_ALLOWED_MODELS' -DefaultValue 'gpt-5.5,gpt-5.4')",
+        "CODEX_ALLOWED_MODELS=$allowedModels",
         "CODEX_TIMEOUT_SECONDS=$(Get-EnvValue -Map $Existing -Key 'CODEX_TIMEOUT_SECONDS' -DefaultValue '1800')",
         "RECENT_DEFAULT_COUNT=$(Get-EnvValue -Map $Existing -Key 'RECENT_DEFAULT_COUNT' -DefaultValue '5')",
         "MAX_HISTORY_CHARS=$(Get-EnvValue -Map $Existing -Key 'MAX_HISTORY_CHARS' -DefaultValue '12000')",
@@ -805,7 +816,7 @@ function Show-QuickStartHelp {
     Write-Host "  /status                       显示桥接器状态"
     Write-Host "  /whoami                       显示当前 QQ Gateway openid"
     Write-Host "  /model                        显示当前模型和思考强度"
-    Write-Host "  /model gpt-5.5 high           设置模型和思考强度"
+    Write-Host "  /model gpt-5.6-sol medium     设置模型和思考强度"
     Write-Host "  /setup                        显示设置面板"
     Write-Host "  /permission                   显示权限模式"
     Write-Host "  /timeout 45                   设置单次 Codex 调用超时为 45 分钟"
